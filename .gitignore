@@ -9,15 +9,17 @@ __pycache__/
 *.so
 *.a
 *.out
+dist/
+build/
 target/
 
 # Dependencies
 .venv/
 venv/
 node_modules/
-.julia/
-zig-cache/
-zig-out/
+.mypy_cache/
+.pytest_cache/
+.gradle/
 
 # Logs and temp files
 *.log
@@ -34,14 +36,14 @@ zig-out/
 .vscode/
 .idea/
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# OS
+# System files
 .DS_Store
 Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
 
 # Compressed files
 *.zip
