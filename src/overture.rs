@@ -402,8 +402,7 @@ fn overlaps_with_grid(
     let cz = cz as i32;
 
     // Look up grid cell (grid bounds passed in from caller)
-    const CELL_SIZE: i32 = 64;
-    let cell_key = ((cx - grid_min_x) / CELL_SIZE, (cz - grid_min_z) / CELL_SIZE);
+    let cell_key = ((cx - grid_min_x) / cell_size, (cz - grid_min_z) / cell_size);
     if let Some(candidates) = grid.get(&cell_key) {
         for &idx in candidates {
             let (min_x, min_z, max_x, max_z) = bboxes[idx];
