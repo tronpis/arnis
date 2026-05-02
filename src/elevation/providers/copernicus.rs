@@ -31,6 +31,10 @@ impl ElevationProvider for CopernicusDem30 {
         30.0
     }
 
+    fn clone_box(&self) -> Box<dyn ElevationProvider> {
+        Box::new(CopernicusDem30)
+    }
+
     fn fetch_raw(
         &self,
         bbox: &LLBBox,

@@ -16,7 +16,7 @@ pub trait ElevationProvider: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Coverage bounding boxes in EPSG:4326.
-    /// Returns `None` for global fallback providers (e.g., AWS Terrain Tiles).
+    /// Returns `None` for global fallback providers (e.g., AWS Terrain Tiles, Copernicus DEM).
     /// Returns multiple bboxes for providers covering non-contiguous regions
     /// (e.g., France + overseas territories).
     fn coverage_bboxes(&self) -> Option<Vec<LLBBox>>;
@@ -33,4 +33,14 @@ pub trait ElevationProvider: Send + Sync {
         grid_width: usize,
         grid_height: usize,
     ) -> Result<RawElevationGrid, Box<dyn std::error::Error>>;
+
+    /// Clone this provider into a boxed trait object.
+    /// All implementations must provide this to allow cloning behind trait objects.
+    fn clone_box(&self) -> Box<dyn ElevationProvider>;
+}
+
+impl Clone for Box<dyn ElevationProvider> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }

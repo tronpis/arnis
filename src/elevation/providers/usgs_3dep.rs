@@ -133,6 +133,10 @@ impl ElevationProvider for Usgs3dep {
         1.0
     }
 
+    fn clone_box(&self) -> Box<dyn ElevationProvider> {
+        Box::new(Usgs3dep)
+    }
+
     fn fetch_raw(
         &self,
         bbox: &LLBBox,

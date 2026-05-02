@@ -267,24 +267,30 @@ pub fn deduplicate_against_osm(
     const CELL_SIZE: i32 = 64;
 
     // Building grid
-    let building_grid = if !osm_building_bboxes.is_empty() {
-        Some(build_spatial_grid(&osm_building_bboxes, CELL_SIZE))
+    let (building_grid, building_grid_min_x, building_grid_min_z) = if !osm_building_bboxes.is_empty() {
+        let grid_min_x = osm_building_bboxes.iter().map(|b| b.0).min().unwrap();
+        let grid_min_z = osm_building_bboxes.iter().map(|b| b.1).min().unwrap();
+        (Some(build_spatial_grid(&osm_building_bboxes, CELL_SIZE)), grid_min_x, grid_min_z)
     } else {
-        None
+        (None, 0, 0)
     };
 
     // Water grid
-    let water_grid = if !osm_water_bboxes.is_empty() {
-        Some(build_spatial_grid(&osm_water_bboxes, CELL_SIZE))
+    let (water_grid, water_grid_min_x, water_grid_min_z) = if !osm_water_bboxes.is_empty() {
+        let grid_min_x = osm_water_bboxes.iter().map(|b| b.0).min().unwrap();
+        let grid_min_z = osm_water_bboxes.iter().map(|b| b.1).min().unwrap();
+        (Some(build_spatial_grid(&osm_water_bboxes, CELL_SIZE)), grid_min_x, grid_min_z)
     } else {
-        None
+        (None, 0, 0)
     };
 
     // Landuse grid
-    let landuse_grid = if !osm_landuse_bboxes.is_empty() {
-        Some(build_spatial_grid(&osm_landuse_bboxes, CELL_SIZE))
+    let (landuse_grid, landuse_grid_min_x, landuse_grid_min_z) = if !osm_landuse_bboxes.is_empty() {
+        let grid_min_x = osm_landuse_bboxes.iter().map(|b| b.0).min().unwrap();
+        let grid_min_z = osm_landuse_bboxes.iter().map(|b| b.1).min().unwrap();
+        (Some(build_spatial_grid(&osm_landuse_bboxes, CELL_SIZE)), grid_min_x, grid_min_z)
     } else {
-        None
+        (None, 0, 0)
     };
 
     overture_elements
@@ -298,7 +304,7 @@ pub fn deduplicate_against_osm(
                 // Check if this is a building
                 if way.tags.contains_key("building") || way.tags.contains_key("building:part") {
                     if let Some(ref grid) = building_grid {
-                        if overlaps_with_grid(way, grid, &osm_building_bboxes) {
+                        if overlaps_with_grid(way, grid, &osm_building_bboxes, building_grid_min_x, building_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
@@ -325,7 +331,7 @@ pub fn deduplicate_against_osm(
                     || way.tags.contains_key("water")
                 {
                     if let Some(ref grid) = water_grid {
-                        if overlaps_with_grid(way, grid, &osm_water_bboxes) {
+                        if overlaps_with_grid(way, grid, &osm_water_bboxes, water_grid_min_x, water_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
@@ -335,7 +341,7 @@ pub fn deduplicate_against_osm(
                 // Check if this is a landuse feature
                 if way.tags.contains_key("landuse") || way.tags.contains_key("leisure") {
                     if let Some(ref grid) = landuse_grid {
-                        if overlaps_with_grid(way, grid, &osm_landuse_bboxes) {
+                        if overlaps_with_grid(way, grid, &osm_landuse_bboxes, landuse_grid_min_x, landuse_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
@@ -382,6 +388,8 @@ fn overlaps_with_grid(
     way: &ProcessedWay,
     grid: &HashMap<(i32, i32), Vec<usize>>,
     bboxes: &[(i32, i32, i32, i32)],
+    grid_min_x: i32,
+    grid_min_z: i32,
 ) -> bool {
     if way.nodes.is_empty() {
         return false;
@@ -393,12 +401,8 @@ fn overlaps_with_grid(
     let cx = cx as i32;
     let cz = cz as i32;
 
-    // Find grid bounds for lookup
-    let grid_min_x = bboxes.iter().map(|b| b.0).min().unwrap();
-    let grid_min_z = bboxes.iter().map(|b| b.1).min().unwrap();
-
-    // Look up grid cell
-    let cell_key = ((cx - grid_min_x) / 64, (cz - grid_min_z) / 64);
+    // Look up grid cell (grid bounds passed in from caller)
+    let cell_key = ((cx - grid_min_x) / cell_size, (cz - grid_min_z) / cell_size);
     if let Some(candidates) = grid.get(&cell_key) {
         for &idx in candidates {
             let (min_x, min_z, max_x, max_z) = bboxes[idx];
@@ -523,7 +527,7 @@ fn fetch_overture_features_inner(
             );
         }
 
-        match process_partition_file_by_collection(&client, url, collection, bbox, debug) {
+        match process_partition_file_by_collection(&client, url, collection, bbox, scale, debug) {
             Ok(elements) => {
                 let count = elements.len();
                 *feature_counts.entry(collection_name.as_str()).or_insert(0) += count;
@@ -562,6 +566,7 @@ fn process_partition_file_by_collection(
     url: &str,
     collection: OvertureCollection,
     bbox: &LLBBox,
+    scale: f64,
     debug: bool,
 ) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
     // Get file size via HEAD request
@@ -634,6 +639,9 @@ fn process_partition_file_by_collection(
     sparse.finalize();
     let reader = SerializedFileReader::new(sparse)?;
 
+    // Compute coord_transformer once for all elements in this partition
+    let (coord_transformer, xzbbox) = CoordTransformer::llbbox_to_xzbbox(bbox, scale)?;
+
     let target_min_lng = bbox.min().lng();
     let target_max_lng = bbox.max().lng();
     let target_min_lat = bbox.min().lat();
@@ -650,6 +658,7 @@ fn process_partition_file_by_collection(
             target_max_lng,
             target_min_lat,
             target_max_lat,
+            &coord_transformer,
         ) {
             Ok(rg_elements) => elements.extend(rg_elements),
             Err(e) => {
@@ -660,8 +669,8 @@ fn process_partition_file_by_collection(
         }
     }
 
-    // Clip elements to bbox
-    let (coord_transformer, xzbbox) = CoordTransformer::llbbox_to_xzbbox(bbox, scale)?;
+    // Clip elements to bbox (compute transformer once for all elements)
+    // coord_transformer and xzbbox already computed above
 
     let clipped_elements: Vec<ProcessedElement> = elements
         .into_iter()
@@ -1109,6 +1118,7 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
     target_max_lng: f64,
     target_min_lat: f64,
     target_max_lat: f64,
+    coord_transformer: &CoordTransformer,
 ) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
     let row_group_reader = reader.get_row_group(rg_idx)?;
     let row_iter = row_group_reader.get_row_iter(None)?;
@@ -1135,7 +1145,7 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if b.is_osm_sourced {
                         return None;
                     }
-                    building_to_processed_way(&b, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    building_to_processed_way(&b, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
                 })
                 .collect())
         }
@@ -1160,7 +1170,7 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if r.is_osm_sourced {
                         return None;
                     }
-                    road_to_processed_way(&r, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    road_to_processed_way(&r, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
                 })
                 .collect())
         }
@@ -1185,7 +1195,7 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if w.is_osm_sourced {
                         return None;
                     }
-                    water_to_processed_way(&w, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    water_to_processed_way(&w, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
                 })
                 .collect())
         }
@@ -1210,7 +1220,7 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if l.is_osm_sourced {
                         return None;
                     }
-                    landuse_to_processed_way(&l, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    landuse_to_processed_way(&l, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
                 })
                 .collect())
         }
@@ -1771,7 +1781,10 @@ fn parse_wkb_linestring(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
         u32::from_be_bytes([wkb[5], wkb[6], wkb[7], wkb[8]])
     };
 
-    if num_points == 0 {
+    // Validate num_points to prevent resource exhaustion from malformed WKB
+    // Reasonable upper bound: 10 million points (would be ~160MB for 2D)
+    const MAX_POINTS: u32 = 10_000_000;
+    if num_points == 0 || num_points > MAX_POINTS {
         return None;
     }
 
@@ -1784,7 +1797,7 @@ fn parse_wkb_linestring(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
 
     let needed = num_points as usize * point_size;
     if offset + needed > wkb.len() {
-        return None;
+        return None; // Buffer doesn't contain enough data for claimed number of points
     }
 
     let mut coords = Vec::with_capacity(num_points as usize);
@@ -1906,6 +1919,12 @@ fn parse_wkb_polygon(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
     };
     offset += 4;
 
+    // Validate num_points to prevent resource exhaustion from malformed WKB
+    const MAX_POINTS: u32 = 10_000_000;
+    if num_points == 0 || num_points > MAX_POINTS {
+        return None;
+    }
+
     // Determine point stride (2D = 16 bytes, 3D = 24 bytes, etc.)
     let has_z = (geom_type / 1000) == 1 || (geom_type / 1000) == 3;
     let has_m = (geom_type / 1000) == 2 || (geom_type / 1000) == 3;
@@ -1913,7 +1932,7 @@ fn parse_wkb_polygon(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
 
     let needed = num_points as usize * point_size;
     if offset + needed > wkb.len() {
-        return None;
+        return None; // Buffer doesn't contain enough data for claimed number of points
     }
 
     let mut coords = Vec::with_capacity(num_points as usize);

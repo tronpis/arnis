@@ -17,12 +17,15 @@ pub fn bboxes_overlap(a: &LLBBox, b: &LLBBox) -> bool {
 
 /// Select the best elevation provider for the given bounding box.
 ///
-/// Iterates providers ordered by resolution (finest first), returns the first
-/// whose coverage overlaps the user's bbox. Falls back to AWS Terrain Tiles.
+/// Iterates providers ordered by resolution (finest first):
+/// - First, returns the first regional provider whose coverage overlaps the user's bbox.
+/// - If no regional provider matches, returns the best global provider (lowest resolution value).
+/// - Falls back to AWS Terrain Tiles if no global provider exists.
 pub fn select_provider(bbox: &LLBBox) -> Box<dyn ElevationProvider> {
     let candidates: Vec<Box<dyn ElevationProvider>> = build_provider_list();
 
-    for provider in candidates {
+    // First pass: look for regional providers with overlapping coverage
+    for provider in &candidates {
         if let Some(coverages) = provider.coverage_bboxes() {
             if coverages.iter().any(|c| bboxes_overlap(c, bbox)) {
                 println!(
@@ -30,9 +33,34 @@ pub fn select_provider(bbox: &LLBBox) -> Box<dyn ElevationProvider> {
                     provider.name(),
                     provider.native_resolution_m()
                 );
-                return provider;
+                return provider.clone_box();
             }
         }
+    }
+
+    // Second pass: no regional match, look for global providers (coverage_bboxes() == None)
+    // Select the one with the best (lowest) resolution. Prefer Copernicus over AWS if tied.
+    let mut best_global: Option<Box<dyn ElevationProvider>> = None;
+    let mut best_resolution = f64::MAX;
+
+    for provider in &candidates {
+        if provider.coverage_bboxes().is_none() {
+            let res = provider.native_resolution_m();
+            // Prefer lower resolution, or if tied, prefer Copernicus over AWS
+            if res < best_resolution || (res == best_resolution && provider.name() == "copernicus_30m") {
+                best_resolution = res;
+                best_global = Some(provider.clone_box());
+            }
+        }
+    }
+
+    if let Some(provider) = best_global {
+        println!(
+            "Selected elevation provider: {} ({:.0}m resolution, global coverage)",
+            provider.name(),
+            provider.native_resolution_m()
+        );
+        return provider;
     }
 
     // Global fallback
@@ -78,9 +106,9 @@ mod tests {
 
     #[test]
     fn test_select_provider_fallback() {
-        // Bbox outside all regional coverage should fall back to AWS
+        // Bbox outside all regional coverage should fall back to Copernicus (best global provider)
         let bbox = LLBBox::new(-33.86, 151.20, -33.85, 151.22).unwrap();
         let provider = select_provider(&bbox);
-        assert_eq!(provider.name(), "aws");
+        assert_eq!(provider.name(), "copernicus_30m");
     }
 }

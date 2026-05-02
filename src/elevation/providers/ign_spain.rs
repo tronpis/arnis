@@ -138,6 +138,10 @@ impl ElevationProvider for IgnSpain {
         5.0
     }
 
+    fn clone_box(&self) -> Box<dyn ElevationProvider> {
+        Box::new(IgnSpain)
+    }
+
     fn fetch_raw(
         &self,
         bbox: &LLBBox,
