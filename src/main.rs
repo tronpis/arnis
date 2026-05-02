@@ -176,11 +176,20 @@ fn run_cli() {
     let (mut parsed_elements, mut xzbbox) =
         osm_parser::parse_osm_data(raw_data, args.bbox, args.scale, args.debug);
 
-    // Fetch supplementary building data from Overture Maps
+    // Fetch supplementary data from Overture Maps (buildings, roads, water, land use)
     {
         println!("{} Fetching Overture Maps data...", "  [+]".bold());
-        let overture_elements =
-            overture::fetch_overture_buildings(&args.bbox, args.scale, args.debug);
+        let overture_elements = overture::fetch_overture_features(
+            &args.bbox,
+            args.scale,
+            args.debug,
+            &[
+                overture::OvertureCollection::Building,
+                overture::OvertureCollection::Road,
+                overture::OvertureCollection::Water,
+                overture::OvertureCollection::LandUse,
+            ],
+        );
         if !overture_elements.is_empty() {
             let before_count = parsed_elements.len();
             let unique_overture =
@@ -188,11 +197,11 @@ fn run_cli() {
             parsed_elements.extend(unique_overture);
             let added = parsed_elements.len() - before_count;
             println!(
-                "  Added {} buildings from Overture Maps",
+                "  Added {} features from Overture Maps",
                 added.to_string().bright_white().bold()
             );
         } else {
-            println!("  No additional buildings from Overture Maps for this area");
+            println!("  No additional features from Overture Maps for this area");
         }
     }
 

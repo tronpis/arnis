@@ -1,9 +1,9 @@
-//! Overture Maps building data integration.
+//! Overture Maps data integration.
 //!
-//! Fetches ML-derived building footprints from Overture Maps to complement
-//! OpenStreetMap data. Only buildings NOT sourced from OSM are included,
-//! filling gaps in areas with sparse OSM coverage (e.g., rural Africa,
-//! parts of Asia).
+//! Fetches ML-derived features from Overture Maps to complement OpenStreetMap data.
+//! Supports multiple collections: buildings, roads, water, and land use.
+//! Only features NOT sourced from OSM are included, filling gaps in areas
+//! with sparse OSM coverage (e.g., rural Africa, parts of Asia).
 //!
 //! Data is read from GeoParquet files hosted on Azure Blob Storage using
 //! HTTP Range requests (same pattern as land_cover.rs COG reading).
@@ -36,8 +36,50 @@ const OVERTURE_ID_HIGH_BIT: u64 = 0x8000_0000_0000_0000;
 /// Maximum number of Overture buildings to add (safety limit for huge areas)
 const MAX_OVERTURE_BUILDINGS: usize = 100_000;
 
+/// Maximum number of Overture roads to add (safety limit for huge areas)
+const MAX_OVERTURE_ROADS: usize = 50_000;
+
+/// Maximum number of Overture water features to add (safety limit for huge areas)
+const MAX_OVERTURE_WATER: usize = 20_000;
+
+/// Maximum number of Overture land use features to add (safety limit for huge areas)
+const MAX_OVERTURE_LAND_USE: usize = 20_000;
+
 /// HTTP client timeout for Overture data fetching
 const HTTP_TIMEOUT_SECS: u64 = 120;
+
+// ─── Public types ────────────────────────────────────────────────────────
+
+/// Overture Maps collection types available for fetching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OvertureCollection {
+    Building,
+    Road,
+    Water,
+    LandUse,
+}
+
+impl OvertureCollection {
+    /// Name of the collection in the STAC catalog.
+    pub fn stac_name(&self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::Road => "road",
+            Self::Water => "water",
+            Self::LandUse => "land_use",
+        }
+    }
+
+    /// Maximum number of features to fetch for this collection.
+    pub fn max_features(&self) -> usize {
+        match self {
+            Self::Building => MAX_OVERTURE_BUILDINGS,
+            Self::Road => MAX_OVERTURE_ROADS,
+            Self::Water => MAX_OVERTURE_WATER,
+            Self::LandUse => MAX_OVERTURE_LAND_USE,
+        }
+    }
+}
 
 // ─── Internal data types ─────────────────────────────────────────────────
 
@@ -69,6 +111,51 @@ struct OvertureBuilding {
     facade_color: Option<String>,
     /// Roof color (hex or name)
     roof_color: Option<String>,
+}
+
+/// A road parsed from Overture Maps GeoParquet data.
+struct OvertureRoad {
+    /// GERS ID (UUID string)
+    id: String,
+    /// LineString coordinates as (longitude, latitude) pairs
+    linestring: Vec<(f64, f64)>,
+    /// Whether the primary source is OpenStreetMap
+    is_osm_sourced: bool,
+    /// Overture class (e.g., "primary", "residential", "path")
+    class: Option<String>,
+    /// Surface material (e.g., "paved", "unpaved", "asphalt")
+    surface: Option<String>,
+    /// Bounding box for spatial filtering
+    bbox_xmin: Option<f64>,
+    bbox_ymin: Option<f64>,
+    bbox_xmax: Option<f64>,
+    bbox_ymax: Option<f64>,
+}
+
+/// A water feature parsed from Overture Maps GeoParquet data.
+struct OvertureWater {
+    /// GERS ID (UUID string)
+    id: String,
+    /// Exterior ring coordinates as (longitude, latitude) pairs
+    exterior_ring: Vec<(f64, f64)>,
+    /// Whether the primary source is OpenStreetMap
+    is_osm_sourced: bool,
+    /// Overture subtype (e.g., "river", "lake", "ocean")
+    subtype: Option<String>,
+    /// Overture class (e.g., "water", "wetland")
+    class: Option<String>,
+}
+
+/// A land use feature parsed from Overture Maps GeoParquet data.
+struct OvertureLandUse {
+    /// GERS ID (UUID string)
+    id: String,
+    /// Exterior ring coordinates as (longitude, latitude) pairs
+    exterior_ring: Vec<(f64, f64)>,
+    /// Whether the primary source is OpenStreetMap
+    is_osm_sourced: bool,
+    /// Overture class (e.g., "residential", "industrial", "park")
+    class: Option<String>,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────
@@ -122,31 +209,83 @@ pub fn deduplicate_against_osm(
         })
         .collect();
 
-    if osm_building_bboxes.is_empty() {
-        return overture_elements;
-    }
+    // Collect OSM roads for road deduplication (highway=* ways)
+    let osm_roads: Vec<&ProcessedWay> = osm_elements
+        .iter()
+        .filter_map(|el| {
+            if let ProcessedElement::Way(way) = el {
+                if way.tags.contains_key("highway") && way.nodes.len() >= 2 {
+                    return Some(way);
+                }
+            }
+            None
+        })
+        .collect();
 
-    // Build a simple spatial grid for fast overlap checks.
-    // Grid cell size of 64 blocks keeps the grid manageable while providing
-    // good spatial filtering.
+    // Collect OSM water features for water deduplication
+    let osm_water_bboxes: Vec<(i32, i32, i32, i32)> = osm_elements
+        .iter()
+        .filter_map(|el| {
+            if let ProcessedElement::Way(way) = el {
+                if (way.tags.contains_key("natural") && way.tags.get("natural") == Some(&"water".to_string()))
+                    || way.tags.contains_key("waterway")
+                    || way.tags.contains_key("water")
+                {
+                    if way.nodes.len() >= 3 {
+                        let min_x = way.nodes.iter().map(|n| n.x).min().unwrap();
+                        let max_x = way.nodes.iter().map(|n| n.x).max().unwrap();
+                        let min_z = way.nodes.iter().map(|n| n.z).min().unwrap();
+                        let max_z = way.nodes.iter().map(|n| n.z).max().unwrap();
+                        return Some((min_x, min_z, max_x, max_z));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Collect OSM landuse features for landuse deduplication
+    let osm_landuse_bboxes: Vec<(i32, i32, i32, i32)> = osm_elements
+        .iter()
+        .filter_map(|el| {
+            if let ProcessedElement::Way(way) = el {
+                if way.tags.contains_key("landuse") || way.tags.contains_key("leisure") {
+                    if way.nodes.len() >= 3 {
+                        let min_x = way.nodes.iter().map(|n| n.x).min().unwrap();
+                        let max_x = way.nodes.iter().map(|n| n.x).max().unwrap();
+                        let min_z = way.nodes.iter().map(|n| n.z).min().unwrap();
+                        let max_z = way.nodes.iter().map(|n| n.z).max().unwrap();
+                        return Some((min_x, min_z, max_x, max_z));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Build spatial grids for fast overlap checks
     const CELL_SIZE: i32 = 64;
 
-    let grid_min_x = osm_building_bboxes.iter().map(|b| b.0).min().unwrap();
-    let grid_min_z = osm_building_bboxes.iter().map(|b| b.1).min().unwrap();
+    // Building grid
+    let building_grid = if !osm_building_bboxes.is_empty() {
+        Some(build_spatial_grid(&osm_building_bboxes, CELL_SIZE))
+    } else {
+        None
+    };
 
-    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    for (idx, &(min_x, min_z, max_x, max_z)) in osm_building_bboxes.iter().enumerate() {
-        let cell_x_start = (min_x - grid_min_x) / CELL_SIZE;
-        let cell_z_start = (min_z - grid_min_z) / CELL_SIZE;
-        let cell_x_end = (max_x - grid_min_x) / CELL_SIZE;
-        let cell_z_end = (max_z - grid_min_z) / CELL_SIZE;
+    // Water grid
+    let water_grid = if !osm_water_bboxes.is_empty() {
+        Some(build_spatial_grid(&osm_water_bboxes, CELL_SIZE))
+    } else {
+        None
+    };
 
-        for cx in cell_x_start..=cell_x_end {
-            for cz in cell_z_start..=cell_z_end {
-                grid.entry((cx, cz)).or_default().push(idx);
-            }
-        }
-    }
+    // Landuse grid
+    let landuse_grid = if !osm_landuse_bboxes.is_empty() {
+        Some(build_spatial_grid(&osm_landuse_bboxes, CELL_SIZE))
+    } else {
+        None
+    };
 
     overture_elements
         .into_iter()
@@ -155,23 +294,56 @@ pub fn deduplicate_against_osm(
                 if way.nodes.is_empty() {
                     return false;
                 }
-                // Compute centroid
-                let cx = way.nodes.iter().map(|n| n.x as i64).sum::<i64>() / way.nodes.len() as i64;
-                let cz = way.nodes.iter().map(|n| n.z as i64).sum::<i64>() / way.nodes.len() as i64;
-                let cx = cx as i32;
-                let cz = cz as i32;
 
-                // Look up grid cell
-                let cell_key = ((cx - grid_min_x) / CELL_SIZE, (cz - grid_min_z) / CELL_SIZE);
-                if let Some(candidates) = grid.get(&cell_key) {
-                    for &idx in candidates {
-                        let (min_x, min_z, max_x, max_z) = osm_building_bboxes[idx];
-                        if cx >= min_x && cx <= max_x && cz >= min_z && cz <= max_z {
-                            return false; // Overlaps with existing OSM building
+                // Check if this is a building
+                if way.tags.contains_key("building") || way.tags.contains_key("building:part") {
+                    if let Some(ref grid) = building_grid {
+                        if overlaps_with_grid(way, grid, &osm_building_bboxes) {
+                            return false;
                         }
                     }
+                    return true;
                 }
-                true
+
+                // Check if this is a road - deduplicate by proximity to existing OSM roads
+                if way.tags.contains_key("highway") {
+                    if !osm_roads.is_empty() {
+                        // For roads, check if any point is within threshold distance of an OSM road
+                        const ROAD_DEDUPE_THRESHOLD: i32 = 5; // blocks
+                        for osm_road in &osm_roads {
+                            if ways_are_close(way, osm_road, ROAD_DEDUPE_THRESHOLD) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                }
+
+                // Check if this is a water feature
+                if way.tags.contains_key("natural") && way.tags.get("natural") == Some(&"water".to_string())
+                    || way.tags.contains_key("waterway")
+                    || way.tags.contains_key("water")
+                {
+                    if let Some(ref grid) = water_grid {
+                        if overlaps_with_grid(way, grid, &osm_water_bboxes) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
+                // Check if this is a landuse feature
+                if way.tags.contains_key("landuse") || way.tags.contains_key("leisure") {
+                    if let Some(ref grid) = landuse_grid {
+                        if overlaps_with_grid(way, grid, &osm_landuse_bboxes) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
+                // Unknown type - keep it
+                return true;
             } else {
                 true
             }
@@ -179,12 +351,114 @@ pub fn deduplicate_against_osm(
         .collect()
 }
 
-// ─── Inner implementation ────────────────────────────────────────────────
+/// Build a spatial grid for fast overlap lookups.
+fn build_spatial_grid(
+    bboxes: &[(i32, i32, i32, i32)],
+    cell_size: i32,
+) -> HashMap<(i32, i32), Vec<usize>> {
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
 
-fn fetch_overture_buildings_inner(
+    let grid_min_x = bboxes.iter().map(|b| b.0).min().unwrap();
+    let grid_min_z = bboxes.iter().map(|b| b.1).min().unwrap();
+
+    for (idx, &(min_x, min_z, max_x, max_z)) in bboxes.iter().enumerate() {
+        let cell_x_start = (min_x - grid_min_x) / cell_size;
+        let cell_z_start = (min_z - grid_min_z) / cell_size;
+        let cell_x_end = (max_x - grid_min_x) / cell_size;
+        let cell_z_end = (max_z - grid_min_z) / cell_size;
+
+        for cx in cell_x_start..=cell_x_end {
+            for cz in cell_z_start..=cell_z_end {
+                grid.entry((cx, cz)).or_default().push(idx);
+            }
+        }
+    }
+
+    grid
+}
+
+/// Check if a way overlaps with any bbox in the spatial grid.
+fn overlaps_with_grid(
+    way: &ProcessedWay,
+    grid: &HashMap<(i32, i32), Vec<usize>>,
+    bboxes: &[(i32, i32, i32, i32)],
+) -> bool {
+    if way.nodes.is_empty() {
+        return false;
+    }
+
+    // Compute centroid
+    let cx = way.nodes.iter().map(|n| n.x as i64).sum::<i64>() / way.nodes.len() as i64;
+    let cz = way.nodes.iter().map(|n| n.z as i64).sum::<i64>() / way.nodes.len() as i64;
+    let cx = cx as i32;
+    let cz = cz as i32;
+
+    // Find grid bounds for lookup
+    let grid_min_x = bboxes.iter().map(|b| b.0).min().unwrap();
+    let grid_min_z = bboxes.iter().map(|b| b.1).min().unwrap();
+
+    // Look up grid cell
+    let cell_key = ((cx - grid_min_x) / 64, (cz - grid_min_z) / 64);
+    if let Some(candidates) = grid.get(&cell_key) {
+        for &idx in candidates {
+            let (min_x, min_z, max_x, max_z) = bboxes[idx];
+            if cx >= min_x && cx <= max_x && cz >= min_z && cz <= max_z {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if two ways are within threshold distance of each other.
+/// Used for road deduplication.
+fn ways_are_close(way1: &ProcessedWay, way2: &ProcessedWay, threshold: i32) -> bool {
+    // Simple approach: check if any node of way1 is within threshold of any node of way2
+    // This is O(n*m) but roads typically have <100 nodes and we exit early on match
+    for n1 in &way1.nodes {
+        for n2 in &way2.nodes {
+            let dx = (n1.x - n2.x).abs();
+            let dz = (n1.z - n2.z).abs();
+            if dx <= threshold && dz <= threshold {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Fetch features from multiple Overture Maps collections for the given bbox.
+///
+/// Returns `ProcessedElement` vectors with OSM-compatible tags, ready to merge
+/// with the main element list. Returns an empty Vec on any failure (non-fatal).
+///
+/// Features whose primary source is "OpenStreetMap" are excluded to avoid
+/// duplicates with the existing OSM data pipeline.
+pub fn fetch_overture_features(
     bbox: &LLBBox,
     scale: f64,
     debug: bool,
+    collections: &[OvertureCollection],
+) -> Vec<ProcessedElement> {
+    match fetch_overture_features_inner(bbox, scale, debug, collections) {
+        Ok(elements) => elements,
+        Err(e) => {
+            eprintln!(
+                "{} Failed to fetch Overture Maps data: {e}",
+                "Warning:".yellow().bold()
+            );
+            Vec::new()
+        }
+    }
+}
+
+// ─── Inner implementation ────────────────────────────────────────────────
+
+fn fetch_overture_features_inner(
+    bbox: &LLBBox,
+    scale: f64,
+    debug: bool,
+    collections: &[OvertureCollection],
 ) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
     let client = Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -197,9 +471,11 @@ fn fetch_overture_buildings_inner(
 
     emit_gui_progress_update(14.5, "Fetching Overture Maps data...");
 
+    // Collect collection names for STAC query
+    let collection_names: Vec<&str> = collections.iter().map(|c| c.stac_name()).collect();
+
     // List partition files whose geographic bounds overlap our bbox
-    // (single ~230 KB STAC download instead of 512 HTTP requests)
-    let partition_urls = list_partition_files(&client, bbox, debug)?;
+    let partition_urls = list_partition_files(&client, bbox, &collection_names, debug)?;
     if partition_urls.is_empty() {
         if debug {
             println!("No Overture partitions overlap the bbox");
@@ -209,80 +485,215 @@ fn fetch_overture_buildings_inner(
 
     if debug {
         println!(
-            "Found {} Overture partition(s) for this area",
-            partition_urls.len()
+            "Found {} Overture partition(s) for collections: {:?}",
+            partition_urls.len(),
+            collection_names
         );
     }
 
-    // Process each partition file: read footer, check for bbox overlap, fetch matching rows
-    let mut all_buildings: Vec<OvertureBuilding> = Vec::new();
-    let mut non_osm_count: usize = 0;
+    // Process each partition file by collection type
+    let mut all_elements: Vec<ProcessedElement> = Vec::new();
+    let mut feature_counts: HashMap<&str, usize> = HashMap::new();
 
-    for (i, url) in partition_urls.iter().enumerate() {
-        if non_osm_count >= MAX_OVERTURE_BUILDINGS {
+    for (url, collection_name) in partition_urls.iter() {
+        let collection = collections
+            .iter()
+            .find(|c| c.stac_name() == collection_name.as_str())
+            .copied()
+            .unwrap_or(OvertureCollection::Building);
+
+        let max_features = collection.max_features();
+        let current_count = feature_counts.get(collection_name.as_str()).copied().unwrap_or(0);
+
+        if current_count >= max_features {
             if debug {
-                println!("Reached building limit ({MAX_OVERTURE_BUILDINGS}), stopping");
+                println!(
+                    "Reached {} limit ({max_features}), skipping more",
+                    collection_name
+                );
             }
-            break;
+            continue;
         }
 
-        if debug && i % 10 == 0 {
+        if debug {
             println!(
-                "Processing partition {}/{} ...",
-                i + 1,
-                partition_urls.len()
+                "Processing {} partition: {} ...",
+                collection_name,
+                url.split('/').last().unwrap_or(url)
             );
         }
 
-        match process_partition_file(&client, url, bbox, debug) {
-            Ok(buildings) => {
-                non_osm_count += buildings.iter().filter(|b| !b.is_osm_sourced).count();
-                all_buildings.extend(buildings.into_iter().filter(|b| !b.is_osm_sourced));
+        match process_partition_file_by_collection(&client, url, collection, bbox, debug) {
+            Ok(elements) => {
+                let count = elements.len();
+                *feature_counts.entry(collection_name.as_str()).or_insert(0) += count;
+                all_elements.extend(elements);
             }
             Err(e) => {
                 if debug {
                     eprintln!("Warning: Failed to process partition {url}: {e}");
                 }
-                // Continue with other partitions
             }
         }
     }
 
     if debug {
-        println!("Overture: {} non-OSM buildings found", all_buildings.len());
+        for (coll_name, count) in &feature_counts {
+            println!("Overture {}: {} features", coll_name, count);
+        }
     }
 
-    // Convert to ProcessedElements and clip to xzbbox (matching OSM clipping)
+    Ok(all_elements)
+}
+
+fn fetch_overture_buildings_inner(
+    bbox: &LLBBox,
+    scale: f64,
+    debug: bool,
+) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
+    // Backward-compatible wrapper for the old API - calls new multi-collection function
+    fetch_overture_features_inner(bbox, scale, debug, &[OvertureCollection::Building])
+}
+
+/// Process a single Parquet partition file for a specific collection type.
+/// Returns ProcessedElements ready to merge with OSM data.
+fn process_partition_file_by_collection(
+    client: &Client,
+    url: &str,
+    collection: OvertureCollection,
+    bbox: &LLBBox,
+    debug: bool,
+) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
+    // Get file size via HEAD request
+    let head_resp = client.head(url).send()?;
+    if !head_resp.status().is_success() {
+        return Err(format!("HEAD request failed: {}", head_resp.status()).into());
+    }
+
+    let file_size: u64 = head_resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or("Missing Content-Length header")?;
+
+    if file_size < 12 {
+        return Err("File too small to be valid Parquet".into());
+    }
+
+    // Read the Parquet footer
+    let tail = fetch_range(client, url, file_size - 8, 8)?;
+    if tail.len() < 8 {
+        return Err(format!(
+            "Truncated Parquet tail: expected 8 bytes, got {}",
+            tail.len()
+        )
+        .into());
+    }
+    if &tail[4..8] != b"PAR1" {
+        return Err("Not a valid Parquet file (missing PAR1 magic)".into());
+    }
+
+    let footer_len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
+    if footer_len > file_size - 8 {
+        return Err("Invalid footer length".into());
+    }
+
+    let footer_start = file_size - 8 - footer_len;
+    let footer_bytes = fetch_range(client, url, footer_start, footer_len)?;
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(&footer_bytes)?;
+
+    // Filter row groups by bbox overlap
+    let matching_groups = filter_row_groups_by_bbox(&metadata, bbox);
+    if matching_groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Download only matching row groups via HTTP Range requests
+    let mut sparse = SparseBytes::new(file_size);
+
+    let mut footer_and_tail = Vec::with_capacity(footer_len as usize + 8);
+    footer_and_tail.extend_from_slice(&footer_bytes);
+    footer_and_tail.extend_from_slice(&tail);
+    sparse.add_range(footer_start, bytes::Bytes::from(footer_and_tail));
+
+    for &rg_idx in &matching_groups {
+        let (rg_offset, rg_len) = row_group_byte_range(&metadata, rg_idx);
+        match fetch_range(client, url, rg_offset, rg_len) {
+            Ok(rg_data) => {
+                sparse.add_range(rg_offset, bytes::Bytes::from(rg_data));
+            }
+            Err(e) => {
+                if debug {
+                    eprintln!("Warning: Failed to download row group {rg_idx}: {e}");
+                }
+            }
+        }
+    }
+
+    sparse.finalize();
+    let reader = SerializedFileReader::new(sparse)?;
+
+    let target_min_lng = bbox.min().lng();
+    let target_max_lng = bbox.max().lng();
+    let target_min_lat = bbox.min().lat();
+    let target_max_lat = bbox.max().lat();
+
+    let mut elements: Vec<ProcessedElement> = Vec::new();
+
+    for &rg_idx in &matching_groups {
+        match parse_row_group_by_collection(
+            &reader,
+            rg_idx,
+            collection,
+            target_min_lng,
+            target_max_lng,
+            target_min_lat,
+            target_max_lat,
+        ) {
+            Ok(rg_elements) => elements.extend(rg_elements),
+            Err(e) => {
+                if debug {
+                    eprintln!("Warning: Failed to parse row group {rg_idx}: {e}");
+                }
+            }
+        }
+    }
+
+    // Clip elements to bbox
     let (coord_transformer, xzbbox) = CoordTransformer::llbbox_to_xzbbox(bbox, scale)?;
 
-    let elements: Vec<ProcessedElement> = all_buildings
+    let clipped_elements: Vec<ProcessedElement> = elements
         .into_iter()
-        .take(MAX_OVERTURE_BUILDINGS)
-        .filter_map(|building| {
-            let mut way = building_to_processed_way(&building, &coord_transformer, bbox)?;
-            let clipped = clip_way_to_bbox(&way.nodes, &xzbbox);
-            if clipped.len() < 3 {
-                return None;
+        .filter_map(|element| {
+            if let ProcessedElement::Way(mut way) = element {
+                let clipped = clip_way_to_bbox(&way.nodes, &xzbbox);
+                if clipped.len() < 3 {
+                    return None;
+                }
+                way.nodes = clipped;
+                Some(ProcessedElement::Way(way))
+            } else {
+                Some(element)
             }
-            way.nodes = clipped;
-            Some(ProcessedElement::Way(way))
         })
         .collect();
 
-    Ok(elements)
+    Ok(clipped_elements)
 }
 
 /// List partition file URLs that overlap the target bbox.
 ///
 /// Downloads the STAC `collections.parquet` index (~230 KB) and filters
-/// by collection="building" + geographic bbox overlap. This replaces
+/// by specified collections + geographic bbox overlap. This replaces
 /// the old approach of listing all 512 files from Azure and checking
 /// each one individually (512+ HTTP requests → 1 request).
 fn list_partition_files(
     client: &Client,
     bbox: &LLBBox,
+    collections: &[&str],
     debug: bool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
     // Download the small STAC collections index
     let response = client.get(OVERTURE_STAC_URL).send()?;
     if !response.status().is_success() {
@@ -301,7 +712,7 @@ fn list_partition_files(
     let target_min_lat = bbox.min().lat();
     let target_max_lat = bbox.max().lat();
 
-    let mut urls: Vec<String> = Vec::new();
+    let mut urls: Vec<(String, String)> = Vec::new();
 
     let num_rg = reader.metadata().num_row_groups();
     for rg_idx in 0..num_rg {
@@ -311,7 +722,7 @@ fn list_partition_files(
         for row in row_iter {
             let row = row?;
             // Each row is a STAC item. We need:
-            //   - collection (string) == "building"
+            //   - collection (string) in our target list
             //   - bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax (f64)
             //   - assets.azure.href (string) — the parquet file URL
             let mut collection: Option<String> = None;
@@ -376,10 +787,11 @@ fn list_partition_files(
                 }
             }
 
-            // Filter: only "building" collection items that overlap our bbox
-            if collection.as_deref() != Some("building") {
-                continue;
-            }
+            // Filter: only collections in our target list that overlap our bbox
+            let collection_name = match collection.as_deref() {
+                Some(c) if collections.contains(&c) => c,
+                _ => continue,
+            };
 
             if item_xmin.is_nan() || item_ymin.is_nan() || item_xmax.is_nan() || item_ymax.is_nan()
             {
@@ -394,7 +806,7 @@ fn list_partition_files(
 
             if overlaps {
                 if let Some(href) = azure_href.or(aws_href) {
-                    urls.push(href);
+                    urls.push((href, collection_name.to_string()));
                 }
             }
         }
@@ -402,8 +814,9 @@ fn list_partition_files(
 
     if debug {
         println!(
-            "STAC catalog: found {} partitions overlapping bbox",
-            urls.len()
+            "STAC catalog: found {} partitions overlapping bbox for collections: {:?}",
+            urls.len(),
+            collections
         );
     }
 
@@ -686,6 +1099,124 @@ fn check_rg_overlap(
         && min_ymin <= target_max_lat
 }
 
+/// Parse features from a single row group by collection type.
+/// Dispatches to the appropriate parser function based on the collection.
+fn parse_row_group_by_collection<R: ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
+    rg_idx: usize,
+    collection: OvertureCollection,
+    target_min_lng: f64,
+    target_max_lng: f64,
+    target_min_lat: f64,
+    target_max_lat: f64,
+) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
+    let row_group_reader = reader.get_row_group(rg_idx)?;
+    let row_iter = row_group_reader.get_row_iter(None)?;
+
+    match collection {
+        OvertureCollection::Building => {
+            let mut buildings: Vec<OvertureBuilding> = Vec::new();
+            for row_result in row_iter {
+                let row = row_result?;
+                if let Some(building) = parse_overture_row(
+                    &row,
+                    target_min_lng,
+                    target_max_lng,
+                    target_min_lat,
+                    target_max_lat,
+                ) {
+                    buildings.push(building);
+                }
+            }
+            Ok(buildings
+                .into_iter()
+                .filter_map(|b| {
+                    // Skip OSM-sourced buildings
+                    if b.is_osm_sourced {
+                        return None;
+                    }
+                    building_to_processed_way(&b, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                })
+                .collect())
+        }
+        OvertureCollection::Road => {
+            let mut roads: Vec<OvertureRoad> = Vec::new();
+            for row_result in row_iter {
+                let row = row_result?;
+                if let Some(road) = parse_overture_road_row(
+                    &row,
+                    target_min_lng,
+                    target_max_lng,
+                    target_min_lat,
+                    target_max_lat,
+                ) {
+                    roads.push(road);
+                }
+            }
+            Ok(roads
+                .into_iter()
+                .filter_map(|r| {
+                    // Skip OSM-sourced roads
+                    if r.is_osm_sourced {
+                        return None;
+                    }
+                    road_to_processed_way(&r, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                })
+                .collect())
+        }
+        OvertureCollection::Water => {
+            let mut waters: Vec<OvertureWater> = Vec::new();
+            for row_result in row_iter {
+                let row = row_result?;
+                if let Some(water) = parse_overture_water_row(
+                    &row,
+                    target_min_lng,
+                    target_max_lng,
+                    target_min_lat,
+                    target_max_lat,
+                ) {
+                    waters.push(water);
+                }
+            }
+            Ok(waters
+                .into_iter()
+                .filter_map(|w| {
+                    // Skip OSM-sourced water features
+                    if w.is_osm_sourced {
+                        return None;
+                    }
+                    water_to_processed_way(&w, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                })
+                .collect())
+        }
+        OvertureCollection::LandUse => {
+            let mut land_uses: Vec<OvertureLandUse> = Vec::new();
+            for row_result in row_iter {
+                let row = row_result?;
+                if let Some(land_use) = parse_overture_landuse_row(
+                    &row,
+                    target_min_lng,
+                    target_max_lng,
+                    target_min_lat,
+                    target_max_lat,
+                ) {
+                    land_uses.push(land_use);
+                }
+            }
+            Ok(land_uses
+                .into_iter()
+                .filter_map(|l| {
+                    // Skip OSM-sourced land use features
+                    if l.is_osm_sourced {
+                        return None;
+                    }
+                    landuse_to_processed_way(&l, &CoordTransformer::identity(), &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                })
+                .collect())
+        }
+    }
+}
+
 /// Parse buildings from a single row group of an already-loaded Parquet file.
 fn parse_row_group<R: ChunkReader + 'static>(
     reader: &SerializedFileReader<R>,
@@ -884,6 +1415,431 @@ fn parse_overture_row(
         facade_color,
         roof_color,
     })
+}
+
+/// Parse a single Parquet row into an OvertureRoad.
+///
+/// Returns None if the row doesn't contain a valid road within the bbox,
+/// or if required fields are missing.
+fn parse_overture_road_row(
+    row: &Row,
+    target_min_lng: f64,
+    target_max_lng: f64,
+    target_min_lat: f64,
+    target_max_lat: f64,
+) -> Option<OvertureRoad> {
+    let mut id: Option<String> = None;
+    let mut geometry_bytes: Option<Vec<u8>> = None;
+    let mut sources_str: Option<String> = None;
+    let mut class: Option<String> = None;
+    let mut surface: Option<String> = None;
+    let mut bbox_xmin: Option<f64> = None;
+    let mut bbox_ymin: Option<f64> = None;
+    let mut bbox_xmax: Option<f64> = None;
+    let mut bbox_ymax: Option<f64> = None;
+
+    // Extract fields from the row
+    for (name, field) in row.get_column_iter() {
+        match name.as_str() {
+            "id" => {
+                if let parquet::record::Field::Str(s) = field {
+                    id = Some(s.clone());
+                }
+            }
+            "geometry" => {
+                if let parquet::record::Field::Bytes(b) = field {
+                    geometry_bytes = Some(b.data().to_vec());
+                }
+            }
+            "sources" => {
+                sources_str = Some(format!("{field}"));
+            }
+            "class" => {
+                if let parquet::record::Field::Str(s) = field {
+                    class = Some(s.clone());
+                }
+            }
+            "surface" => {
+                if let parquet::record::Field::Str(s) = field {
+                    surface = Some(s.clone());
+                }
+            }
+            "bbox" => {
+                if let parquet::record::Field::Group(group) = field {
+                    for (sub_name, sub_field) in group.get_column_iter() {
+                        let val = match sub_field {
+                            parquet::record::Field::Double(v) => Some(*v),
+                            parquet::record::Field::Float(v) => Some(*v as f64),
+                            _ => None,
+                        };
+                        if let Some(v) = val {
+                            match sub_name.as_str() {
+                                "xmin" => bbox_xmin = Some(v),
+                                "ymin" => bbox_ymin = Some(v),
+                                "xmax" => bbox_xmax = Some(v),
+                                "ymax" => bbox_ymax = Some(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Quick bbox check
+    if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) =
+        (bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax)
+    {
+        if xmax < target_min_lng
+            || xmin > target_max_lng
+            || ymax < target_min_lat
+            || ymin > target_max_lat
+        {
+            return None;
+        }
+    }
+
+    // Parse geometry (LineString for roads)
+    let geometry_bytes = geometry_bytes?;
+    let linestring = parse_wkb_linestring(&geometry_bytes)?;
+    if linestring.len() < 2 {
+        return None;
+    }
+
+    // Check if primary source is OSM
+    let is_osm = sources_str
+        .as_deref()
+        .map(|s| s.contains("OpenStreetMap"))
+        .unwrap_or(false);
+
+    let id = id?;
+
+    Some(OvertureRoad {
+        id,
+        linestring,
+        is_osm_sourced: is_osm,
+        class,
+        surface,
+        bbox_xmin,
+        bbox_ymin,
+        bbox_xmax,
+        bbox_ymax,
+    })
+}
+
+/// Parse a single Parquet row into an OvertureWater feature.
+///
+/// Returns None if the row doesn't contain a valid water feature within the bbox,
+/// or if required fields are missing.
+fn parse_overture_water_row(
+    row: &Row,
+    target_min_lng: f64,
+    target_max_lng: f64,
+    target_min_lat: f64,
+    target_max_lat: f64,
+) -> Option<OvertureWater> {
+    let mut id: Option<String> = None;
+    let mut geometry_bytes: Option<Vec<u8>> = None;
+    let mut sources_str: Option<String> = None;
+    let mut subtype: Option<String> = None;
+    let mut class: Option<String> = None;
+    let mut bbox_xmin: Option<f64> = None;
+    let mut bbox_ymin: Option<f64> = None;
+    let mut bbox_xmax: Option<f64> = None;
+    let mut bbox_ymax: Option<f64> = None;
+
+    for (name, field) in row.get_column_iter() {
+        match name.as_str() {
+            "id" => {
+                if let parquet::record::Field::Str(s) = field {
+                    id = Some(s.clone());
+                }
+            }
+            "geometry" => {
+                if let parquet::record::Field::Bytes(b) = field {
+                    geometry_bytes = Some(b.data().to_vec());
+                }
+            }
+            "sources" => {
+                sources_str = Some(format!("{field}"));
+            }
+            "subtype" => {
+                if let parquet::record::Field::Str(s) = field {
+                    subtype = Some(s.clone());
+                }
+            }
+            "class" => {
+                if let parquet::record::Field::Str(s) = field {
+                    class = Some(s.clone());
+                }
+            }
+            "bbox" => {
+                if let parquet::record::Field::Group(group) = field {
+                    for (sub_name, sub_field) in group.get_column_iter() {
+                        let val = match sub_field {
+                            parquet::record::Field::Double(v) => Some(*v),
+                            parquet::record::Field::Float(v) => Some(*v as f64),
+                            _ => None,
+                        };
+                        if let Some(v) = val {
+                            match sub_name.as_str() {
+                                "xmin" => bbox_xmin = Some(v),
+                                "ymin" => bbox_ymin = Some(v),
+                                "xmax" => bbox_xmax = Some(v),
+                                "ymax" => bbox_ymax = Some(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Quick bbox check
+    if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) =
+        (bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax)
+    {
+        if xmax < target_min_lng
+            || xmin > target_max_lng
+            || ymax < target_min_lat
+            || ymin > target_max_lat
+        {
+            return None;
+        }
+    }
+
+    // Parse geometry (Polygon for water features)
+    let geometry_bytes = geometry_bytes?;
+    let exterior_ring = parse_wkb_polygon(&geometry_bytes)?;
+    if exterior_ring.len() < 3 {
+        return None;
+    }
+
+    // Check if primary source is OSM
+    let is_osm = sources_str
+        .as_deref()
+        .map(|s| s.contains("OpenStreetMap"))
+        .unwrap_or(false);
+
+    let id = id?;
+
+    Some(OvertureWater {
+        id,
+        exterior_ring,
+        is_osm_sourced: is_osm,
+        subtype,
+        class,
+    })
+}
+
+/// Parse a single Parquet row into an OvertureLandUse feature.
+///
+/// Returns None if the row doesn't contain a valid land use feature within the bbox,
+/// or if required fields are missing.
+fn parse_overture_landuse_row(
+    row: &Row,
+    target_min_lng: f64,
+    target_max_lng: f64,
+    target_min_lat: f64,
+    target_max_lat: f64,
+) -> Option<OvertureLandUse> {
+    let mut id: Option<String> = None;
+    let mut geometry_bytes: Option<Vec<u8>> = None;
+    let mut sources_str: Option<String> = None;
+    let mut class: Option<String> = None;
+    let mut bbox_xmin: Option<f64> = None;
+    let mut bbox_ymin: Option<f64> = None;
+    let mut bbox_xmax: Option<f64> = None;
+    let mut bbox_ymax: Option<f64> = None;
+
+    for (name, field) in row.get_column_iter() {
+        match name.as_str() {
+            "id" => {
+                if let parquet::record::Field::Str(s) = field {
+                    id = Some(s.clone());
+                }
+            }
+            "geometry" => {
+                if let parquet::record::Field::Bytes(b) = field {
+                    geometry_bytes = Some(b.data().to_vec());
+                }
+            }
+            "sources" => {
+                sources_str = Some(format!("{field}"));
+            }
+            "class" => {
+                if let parquet::record::Field::Str(s) = field {
+                    class = Some(s.clone());
+                }
+            }
+            "bbox" => {
+                if let parquet::record::Field::Group(group) = field {
+                    for (sub_name, sub_field) in group.get_column_iter() {
+                        let val = match sub_field {
+                            parquet::record::Field::Double(v) => Some(*v),
+                            parquet::record::Field::Float(v) => Some(*v as f64),
+                            _ => None,
+                        };
+                        if let Some(v) = val {
+                            match sub_name.as_str() {
+                                "xmin" => bbox_xmin = Some(v),
+                                "ymin" => bbox_ymin = Some(v),
+                                "xmax" => bbox_xmax = Some(v),
+                                "ymax" => bbox_ymax = Some(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Quick bbox check
+    if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) =
+        (bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax)
+    {
+        if xmax < target_min_lng
+            || xmin > target_max_lng
+            || ymax < target_min_lat
+            || ymin > target_max_lat
+        {
+            return None;
+        }
+    }
+
+    // Parse geometry (Polygon for land use features)
+    let geometry_bytes = geometry_bytes?;
+    let exterior_ring = parse_wkb_polygon(&geometry_bytes)?;
+    if exterior_ring.len() < 3 {
+        return None;
+    }
+
+    // Check if primary source is OSM
+    let is_osm = sources_str
+        .as_deref()
+        .map(|s| s.contains("OpenStreetMap"))
+        .unwrap_or(false);
+
+    let id = id?;
+
+    Some(OvertureLandUse {
+        id,
+        exterior_ring,
+        is_osm_sourced: is_osm,
+        class,
+    })
+}
+
+/// Parse WKB (Well-Known Binary) LineString geometry into coordinate pairs.
+///
+/// Returns the line coordinates as a sequence of (longitude, latitude) pairs.
+/// Supports both little-endian and big-endian byte order.
+/// Only handles LineString type (WKB type 2). MultiLineString or other types are skipped.
+fn parse_wkb_linestring(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
+    if wkb.len() < 13 {
+        // Minimum: 1 (byte order) + 4 (type) + 4 (num points)
+        return None;
+    }
+
+    let byte_order = wkb[0];
+    if byte_order > 1 {
+        return None;
+    }
+    let is_le = byte_order == 1;
+
+    let geom_type = if is_le {
+        u32::from_le_bytes([wkb[1], wkb[2], wkb[3], wkb[4]])
+    } else {
+        u32::from_be_bytes([wkb[1], wkb[2], wkb[3], wkb[4]])
+    };
+
+    // Type 2 = LineString. ISO WKB uses offsets: +1000 for Z, +2000 for M, +3000 for ZM.
+    let base_type = geom_type % 1000;
+    if base_type != 2 {
+        return None; // Not a LineString
+    }
+
+    let num_points = if is_le {
+        u32::from_le_bytes([wkb[5], wkb[6], wkb[7], wkb[8]])
+    } else {
+        u32::from_be_bytes([wkb[5], wkb[6], wkb[7], wkb[8]])
+    };
+
+    if num_points == 0 {
+        return None;
+    }
+
+    let mut offset = 9;
+
+    // Determine point stride (2D = 16 bytes, 3D = 24 bytes, etc.)
+    let has_z = (geom_type / 1000) == 1 || (geom_type / 1000) == 3;
+    let has_m = (geom_type / 1000) == 2 || (geom_type / 1000) == 3;
+    let point_size: usize = 16 + if has_z { 8 } else { 0 } + if has_m { 8 } else { 0 };
+
+    let needed = num_points as usize * point_size;
+    if offset + needed > wkb.len() {
+        return None;
+    }
+
+    let mut coords = Vec::with_capacity(num_points as usize);
+    for _ in 0..num_points {
+        let x = if is_le {
+            f64::from_le_bytes([
+                wkb[offset],
+                wkb[offset + 1],
+                wkb[offset + 2],
+                wkb[offset + 3],
+                wkb[offset + 4],
+                wkb[offset + 5],
+                wkb[offset + 6],
+                wkb[offset + 7],
+            ])
+        } else {
+            f64::from_be_bytes([
+                wkb[offset],
+                wkb[offset + 1],
+                wkb[offset + 2],
+                wkb[offset + 3],
+                wkb[offset + 4],
+                wkb[offset + 5],
+                wkb[offset + 6],
+                wkb[offset + 7],
+            ])
+        };
+        let y = if is_le {
+            f64::from_le_bytes([
+                wkb[offset + 8],
+                wkb[offset + 9],
+                wkb[offset + 10],
+                wkb[offset + 11],
+                wkb[offset + 12],
+                wkb[offset + 13],
+                wkb[offset + 14],
+                wkb[offset + 15],
+            ])
+        } else {
+            f64::from_be_bytes([
+                wkb[offset + 8],
+                wkb[offset + 9],
+                wkb[offset + 10],
+                wkb[offset + 11],
+                wkb[offset + 12],
+                wkb[offset + 13],
+                wkb[offset + 14],
+                wkb[offset + 15],
+            ])
+        };
+        offset += point_size;
+        coords.push((x, y)); // (longitude, latitude)
+    }
+
+    Some(coords)
 }
 
 /// Parse WKB (Well-Known Binary) Polygon geometry into coordinate pairs.
@@ -1253,6 +2209,282 @@ fn gers_id_to_u64(gers_id: &str) -> u64 {
     hash | OVERTURE_ID_HIGH_BIT
 }
 
+/// Convert an Overture road to a ProcessedWay with OSM-compatible tags.
+fn road_to_processed_way(
+    road: &OvertureRoad,
+    coord_transformer: &CoordTransformer,
+    bbox: &LLBBox,
+) -> Option<ProcessedWay> {
+    let base_id = gers_id_to_u64(&road.id);
+
+    // Convert coordinates to Minecraft XZ
+    let mut nodes: Vec<ProcessedNode> = Vec::with_capacity(road.linestring.len());
+
+    for (i, &(lng, lat)) in road.linestring.iter().enumerate() {
+        if !(-180.0..=180.0).contains(&lng) || !(-90.0..=90.0).contains(&lat) {
+            continue;
+        }
+
+        let llpoint = match LLPoint::new(lat, lng) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let xz = coord_transformer.transform_point(llpoint);
+
+        let node_id = base_id.wrapping_add(i as u64);
+        nodes.push(ProcessedNode {
+            id: node_id,
+            tags: HashMap::new(),
+            x: xz.x,
+            z: xz.z,
+        });
+    }
+
+    // Roads need at least 2 nodes (start and end)
+    if nodes.len() < 2 {
+        return None;
+    }
+
+    // Build OSM-compatible tags
+    let mut tags = HashMap::new();
+
+    // Highway type from Overture class
+    if let Some(ref class) = road.class {
+        let highway_type = overture_class_to_osm_highway(class.as_str());
+        tags.insert("highway".to_string(), highway_type.to_string());
+    } else {
+        tags.insert("highway".to_string(), "path".to_string());
+    }
+
+    // Surface material
+    if let Some(ref surface) = road.surface {
+        let osm_surface = overture_surface_to_osm_surface(surface.as_str());
+        tags.insert("surface".to_string(), osm_surface.to_string());
+    }
+
+    // Mark source as Overture Maps
+    tags.insert("source".to_string(), "overture_maps".to_string());
+
+    Some(ProcessedWay {
+        id: base_id as i64,
+        tags,
+        nodes,
+    })
+}
+
+/// Convert an Overture water feature to a ProcessedWay with OSM-compatible tags.
+fn water_to_processed_way(
+    water: &OvertureWater,
+    coord_transformer: &CoordTransformer,
+    bbox: &LLBBox,
+) -> Option<ProcessedWay> {
+    let base_id = gers_id_to_u64(&water.id);
+
+    // Convert coordinates to Minecraft XZ
+    let mut nodes: Vec<ProcessedNode> = Vec::with_capacity(water.exterior_ring.len());
+
+    for (i, &(lng, lat)) in water.exterior_ring.iter().enumerate() {
+        if !(-180.0..=180.0).contains(&lng) || !(-90.0..=90.0).contains(&lat) {
+            continue;
+        }
+
+        let llpoint = match LLPoint::new(lat, lng) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let xz = coord_transformer.transform_point(llpoint);
+
+        let node_id = base_id.wrapping_add(i as u64);
+        nodes.push(ProcessedNode {
+            id: node_id,
+            tags: HashMap::new(),
+            x: xz.x,
+            z: xz.z,
+        });
+    }
+
+    if nodes.len() < 3 {
+        return None;
+    }
+
+    // Ensure the way is closed
+    if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+        if first.x != last.x || first.z != last.z {
+            let closing_node = ProcessedNode {
+                id: base_id.wrapping_add(water.exterior_ring.len() as u64),
+                tags: HashMap::new(),
+                x: first.x,
+                z: first.z,
+            };
+            nodes.push(closing_node);
+        }
+    }
+
+    // Build OSM-compatible tags
+    let mut tags = HashMap::new();
+
+    // Water type from subtype or class
+    if let Some(ref subtype) = water.subtype {
+        let water_tag = overture_subtype_to_osm_water(subtype.as_str());
+        tags.insert(water_tag.0.to_string(), water_tag.1.to_string());
+    } else if let Some(ref class) = water.class {
+        if class == "water" {
+            tags.insert("natural".to_string(), "water".to_string());
+        } else if class == "wetland" {
+            tags.insert("natural".to_string(), "wetland".to_string());
+        } else {
+            tags.insert("natural".to_string(), "water".to_string());
+        }
+    } else {
+        tags.insert("natural".to_string(), "water".to_string());
+    }
+
+    // Mark source as Overture Maps
+    tags.insert("source".to_string(), "overture_maps".to_string());
+
+    Some(ProcessedWay {
+        id: base_id as i64,
+        tags,
+        nodes,
+    })
+}
+
+/// Convert an Overture land use feature to a ProcessedWay with OSM-compatible tags.
+fn landuse_to_processed_way(
+    land_use: &OvertureLandUse,
+    coord_transformer: &CoordTransformer,
+    bbox: &LLBBox,
+) -> Option<ProcessedWay> {
+    let base_id = gers_id_to_u64(&land_use.id);
+
+    // Convert coordinates to Minecraft XZ
+    let mut nodes: Vec<ProcessedNode> = Vec::with_capacity(land_use.exterior_ring.len());
+
+    for (i, &(lng, lat)) in land_use.exterior_ring.iter().enumerate() {
+        if !(-180.0..=180.0).contains(&lng) || !(-90.0..=90.0).contains(&lat) {
+            continue;
+        }
+
+        let llpoint = match LLPoint::new(lat, lng) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let xz = coord_transformer.transform_point(llpoint);
+
+        let node_id = base_id.wrapping_add(i as u64);
+        nodes.push(ProcessedNode {
+            id: node_id,
+            tags: HashMap::new(),
+            x: xz.x,
+            z: xz.z,
+        });
+    }
+
+    if nodes.len() < 3 {
+        return None;
+    }
+
+    // Ensure the way is closed
+    if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+        if first.x != last.x || first.z != last.z {
+            let closing_node = ProcessedNode {
+                id: base_id.wrapping_add(land_use.exterior_ring.len() as u64),
+                tags: HashMap::new(),
+                x: first.x,
+                z: first.z,
+            };
+            nodes.push(closing_node);
+        }
+    }
+
+    // Build OSM-compatible tags
+    let mut tags = HashMap::new();
+
+    // Land use type from class
+    if let Some(ref class) = land_use.class {
+        let (tag_key, tag_value) = overture_class_to_osm_landuse(class.as_str());
+        tags.insert(tag_key.to_string(), tag_value.to_string());
+    }
+
+    // Mark source as Overture Maps
+    tags.insert("source".to_string(), "overture_maps".to_string());
+
+    Some(ProcessedWay {
+        id: base_id as i64,
+        tags,
+        nodes,
+    })
+}
+
+/// Map Overture road class to OSM highway tag value.
+fn overture_class_to_osm_highway(class: &str) -> &'static str {
+    match class {
+        "motorway" | "highway" => "motorway",
+        "trunk" => "trunk",
+        "primary" => "primary",
+        "secondary" => "secondary",
+        "tertiary" => "tertiary",
+        "residential" => "residential",
+        "service" => "service",
+        "track" => "track",
+        "path" | "pedestrian" => "path",
+        "cycleway" => "cycleway",
+        "footway" => "footway",
+        _ => "unclassified",
+    }
+}
+
+/// Map Overture surface to OSM surface tag value.
+fn overture_surface_to_osm_surface(surface: &str) -> &'static str {
+    match surface.to_lowercase().as_str() {
+        "paved" | "asphalt" | "concrete" => "paved",
+        "unpaved" | "dirt" | "gravel" | "sand" => "unpaved",
+        "grass" => "grass",
+        "cobblestone" => "cobblestone",
+        "metal" | "steel" => "metal",
+        "wood" => "wood",
+        _ => "ground",
+    }
+}
+
+/// Map Overture water subtype to OSM water tag (key, value).
+fn overture_subtype_to_osm_water(subtype: &str) -> (&'static str, &'static str) {
+    match subtype.to_lowercase().as_str() {
+        "river" | "stream" => ("waterway", "river"),
+        "lake" | "pond" | "reservoir" => ("natural", "water"),
+        "ocean" | "sea" => ("natural", "water"),
+        "canal" => ("waterway", "canal"),
+        "drain" => ("waterway", "drain"),
+        "ditch" => ("waterway", "ditch"),
+        "wetland" | "marsh" | "swamp" => ("natural", "wetland"),
+        _ => ("natural", "water"),
+    }
+}
+
+/// Map Overture land use class to OSM landuse/leisure tag (key, value).
+fn overture_class_to_osm_landuse(class: &str) -> (&'static str, &'static str) {
+    match class.to_lowercase().as_str() {
+        "residential" => ("landuse", "residential"),
+        "commercial" => ("landuse", "commercial"),
+        "industrial" => ("landuse", "industrial"),
+        "retail" => ("landuse", "retail"),
+        "park" | "recreation" => ("leisure", "park"),
+        "forest" | "woods" => ("landuse", "forest"),
+        "farmland" | "agriculture" => ("landuse", "farmland"),
+        "meadow" => ("landuse", "meadow"),
+        "cemetery" => ("landuse", "cemetery"),
+        "school" | "education" => ("amenity", "school"),
+        "hospital" => ("amenity", "hospital"),
+        "stadium" | "sports_centre" => ("leisure", "sports_centre"),
+        "playground" => ("leisure", "playground"),
+        "garden" => ("leisure", "garden"),
+        _ => ("landuse", "other"),
+    }
+}
+
 // ─── Sparse byte reader for row-group-only downloads ─────────────────────
 
 /// A sparse in-memory file reader for Parquet.
@@ -1481,5 +2713,123 @@ mod tests {
         assert_eq!(coords.len(), 4);
         assert_eq!(coords[0], (10.0, 20.0)); // Z is ignored
         assert_eq!(coords[1], (11.0, 20.0));
+    }
+
+    #[test]
+    fn test_parse_wkb_linestring_le() {
+        // A simple WKB LineString: 3 points
+        // Little-endian, LineString type (2), 3 points
+        let mut wkb = Vec::new();
+        wkb.push(1u8); // LE
+        wkb.extend_from_slice(&2u32.to_le_bytes()); // LineString
+        wkb.extend_from_slice(&3u32.to_le_bytes()); // 3 points
+
+        // Point 1: (10.0, 20.0)
+        wkb.extend_from_slice(&10.0f64.to_le_bytes());
+        wkb.extend_from_slice(&20.0f64.to_le_bytes());
+        // Point 2: (11.0, 21.0)
+        wkb.extend_from_slice(&11.0f64.to_le_bytes());
+        wkb.extend_from_slice(&21.0f64.to_le_bytes());
+        // Point 3: (12.0, 22.0)
+        wkb.extend_from_slice(&12.0f64.to_le_bytes());
+        wkb.extend_from_slice(&22.0f64.to_le_bytes());
+
+        let coords = parse_wkb_linestring(&wkb).unwrap();
+        assert_eq!(coords.len(), 3);
+        assert_eq!(coords[0], (10.0, 20.0));
+        assert_eq!(coords[1], (11.0, 21.0));
+        assert_eq!(coords[2], (12.0, 22.0));
+    }
+
+    #[test]
+    fn test_parse_wkb_linestring_not_linestring() {
+        // WKB Point (type 1) should return None
+        let mut wkb = Vec::new();
+        wkb.push(1u8);
+        wkb.extend_from_slice(&1u32.to_le_bytes()); // Point type
+        wkb.extend_from_slice(&10.0f64.to_le_bytes());
+        wkb.extend_from_slice(&20.0f64.to_le_bytes());
+
+        assert!(parse_wkb_linestring(&wkb).is_none());
+    }
+
+    #[test]
+    fn test_overture_class_to_osm_highway() {
+        assert_eq!(overture_class_to_osm_highway("motorway"), "motorway");
+        assert_eq!(overture_class_to_osm_highway("primary"), "primary");
+        assert_eq!(overture_class_to_osm_highway("residential"), "residential");
+        assert_eq!(overture_class_to_osm_highway("path"), "path");
+        assert_eq!(overture_class_to_osm_highway("unknown"), "unclassified");
+    }
+
+    #[test]
+    fn test_overture_surface_to_osm_surface() {
+        assert_eq!(overture_surface_to_osm_surface("paved"), "paved");
+        assert_eq!(overture_surface_to_osm_surface("asphalt"), "paved");
+        assert_eq!(overture_surface_to_osm_surface("gravel"), "unpaved");
+        assert_eq!(overture_surface_to_osm_surface("grass"), "grass");
+        assert_eq!(overture_surface_to_osm_surface("unknown"), "ground");
+    }
+
+    #[test]
+    fn test_overture_subtype_to_osm_water() {
+        assert_eq!(overture_subtype_to_osm_water("river"), ("waterway", "river"));
+        assert_eq!(overture_subtype_to_osm_water("lake"), ("natural", "water"));
+        assert_eq!(overture_subtype_to_osm_water("wetland"), ("natural", "wetland"));
+        assert_eq!(overture_subtype_to_osm_water("unknown"), ("natural", "water"));
+    }
+
+    #[test]
+    fn test_overture_class_to_osm_landuse() {
+        assert_eq!(overture_class_to_osm_landuse("residential"), ("landuse", "residential"));
+        assert_eq!(overture_class_to_osm_landuse("park"), ("leisure", "park"));
+        assert_eq!(overture_class_to_osm_landuse("forest"), ("landuse", "forest"));
+        assert_eq!(overture_class_to_osm_landuse("school"), ("amenity", "school"));
+        assert_eq!(overture_class_to_osm_landuse("unknown"), ("landuse", "other"));
+    }
+
+    #[test]
+    fn test_ways_are_close() {
+        use crate::osm_parser::ProcessedNode;
+
+        // Create two ways that are close
+        let way1 = ProcessedWay {
+            id: 1,
+            nodes: vec![
+                ProcessedNode { x: 0, y: 0, z: 0 },
+                ProcessedNode { x: 10, y: 0, z: 0 },
+            ],
+            tags: HashMap::new(),
+        };
+
+        let way2 = ProcessedWay {
+            id: 2,
+            nodes: vec![
+                ProcessedNode { x: 3, y: 0, z: 0 },
+                ProcessedNode { x: 13, y: 0, z: 0 },
+            ],
+            tags: HashMap::new(),
+        };
+
+        // Threshold of 5 should detect closeness (distance is 3)
+        assert!(ways_are_close(&way1, &way2, 5));
+
+        // Threshold of 2 should not detect closeness
+        assert!(!ways_are_close(&way1, &way2, 2));
+    }
+
+    #[test]
+    fn test_build_spatial_grid() {
+        let bboxes = vec![
+            (0, 0, 64, 64),   // bbox 0: covers cell (0,0)
+            (64, 64, 128, 128), // bbox 1: covers cell (1,1)
+        ];
+
+        let grid = build_spatial_grid(&bboxes, 64);
+
+        // Cell (0,0) should contain bbox 0
+        assert!(grid.get(&(0, 0)).unwrap().contains(&0));
+        // Cell (1,1) should contain bbox 1
+        assert!(grid.get(&(1, 1)).unwrap().contains(&1));
     }
 }

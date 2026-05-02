@@ -1,6 +1,7 @@
 use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::provider::ElevationProvider;
 use crate::elevation::providers::aws_terrain::AwsTerrain;
+use crate::elevation::providers::copernicus::CopernicusDem30;
 use crate::elevation::providers::ign_france::IgnFrance;
 use crate::elevation::providers::ign_spain::IgnSpain;
 use crate::elevation::providers::regional::JapanGsi;
@@ -45,10 +46,11 @@ fn build_provider_list() -> Vec<Box<dyn ElevationProvider>> {
     // Ordered by resolution (finest first). First match wins.
     // Only providers verified to return raw elevation data are enabled.
     vec![
-        Box::new(Usgs3dep),  // 1.0m — ArcGIS REST, verified float32
-        Box::new(IgnFrance), // 1.0m — WMS GeoTIFF, verified float32
-        Box::new(IgnSpain),  // 5.0m — WCS, verified int16
-        Box::new(JapanGsi),  // 5.0m — XYZ PNG tiles, custom encoding
+        Box::new(Usgs3dep),        // 1.0m — ArcGIS REST, verified float32
+        Box::new(IgnFrance),       // 1.0m — WMS GeoTIFF, verified float32
+        Box::new(IgnSpain),        // 5.0m — WCS, verified int16
+        Box::new(JapanGsi),        // 5.0m — XYZ PNG tiles, custom encoding
+        Box::new(CopernicusDem30), // 30m — Global (better than AWS for non-regional areas)
     ]
 }
 
