@@ -45,6 +45,10 @@ impl ElevationProvider for AwsTerrain {
         30.0
     }
 
+    fn clone_box(&self) -> Box<dyn ElevationProvider> {
+        Box::new(AwsTerrain)
+    }
+
     fn fetch_raw(
         &self,
         bbox: &LLBBox,

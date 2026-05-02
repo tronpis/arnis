@@ -1,17 +1,7 @@
 ```
-# Dependencies
-target/
-Cargo.lock
-
-# Logs and temp files
-*.log
-*.tmp
-
-# Editors
-.vscode/
-.idea/
-
-# Compiled files
+# Compiled and build artifacts
+*.pyc
+__pycache__/
 *.o
 *.obj
 *.exe
@@ -19,45 +9,39 @@ Cargo.lock
 *.so
 *.a
 *.out
+target/
 
-# Python artifacts (if any Python in project)
-__pycache__/
-*.pyc
-*.pyo
+# Dependencies
+.venv/
+venv/
+node_modules/
+.julia/
+zig-cache/
+zig-out/
 
-# Build artifacts
-build/
-dist/
-*.class
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
 
-# Environment files
+# Environment
 .env
 .env.local
-*.env.*
+.env.*
 
-# OS specific
-.DS_Store
-Thumbs.db
+# Editors
+.vscode/
+.idea/
 
 # Coverage
+.coverage
 coverage/
 htmlcov/
-.coverage
 
-# MyPy
-.mypy_cache/
-
-# Pytest
-.pytest_cache/
-
-# Gradle
-.gradle/
-
-# Julia
-julia-*/
-
-# Zig
-zig*/
+# OS
+.DS_Store
+Thumbs.db
 
 # Compressed files
 *.zip
