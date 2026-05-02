@@ -2267,7 +2267,7 @@ fn road_to_processed_way(
     tags.insert("source".to_string(), "overture_maps".to_string());
 
     Some(ProcessedWay {
-        id: base_id as i64,
+        id: base_id,
         tags,
         nodes,
     })
