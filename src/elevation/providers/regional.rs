@@ -43,6 +43,10 @@ impl ElevationProvider for JapanGsi {
         5.0
     }
 
+    fn clone_box(&self) -> Box<dyn ElevationProvider> {
+        Box::new(JapanGsi)
+    }
+
     fn fetch_raw(
         &self,
         bbox: &LLBBox,

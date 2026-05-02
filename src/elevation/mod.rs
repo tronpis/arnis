@@ -15,6 +15,7 @@ use postprocess::{
 };
 use provider::ElevationProvider;
 use selector::select_provider;
+use providers::aws_terrain::AwsTerrain;
 
 /// Holds processed elevation data and metadata
 #[derive(Clone)]
@@ -111,58 +112,75 @@ pub fn fetch_elevation_data(
 ) -> Result<ElevationData, Box<dyn std::error::Error>> {
     let (world_width, world_height, grid_width, grid_height) = compute_grid_dims(bbox, scale);
 
-    // Select the best provider for this region
-    let provider = select_provider(bbox);
-    let provider_name = provider.name();
+    // Select the best regional provider for this region
+    let regional_provider = select_provider(bbox);
+    let provider_name = regional_provider.name();
     let is_fallback = provider_name == "aws";
 
     emit_gui_progress_update(16.0, "Fetching elevation...");
 
-    // Fetch raw elevation data in meters, falling back to AWS on regional provider failure
-    let raw = match provider.fetch_raw(bbox, grid_width, grid_height) {
-        Ok(raw) if !is_fallback => {
-            // Check if the regional provider returned mostly empty data (out-of-coverage area).
-            // This catches cases where the provider's rectangular bbox over-claims coverage
-            // (e.g., IGN France bbox covers Belgium, but returns no data for Belgian coordinates).
-            let nan_ratio = compute_nan_ratio(&raw.heights_meters);
-            if nan_ratio > 0.5 {
+    // Fetch raw elevation data with merge strategy:
+    // 1. Try regional high-res provider
+    // 2. Also fetch AWS global data
+    // 3. Merge: use regional where valid, AWS for gaps
+    let mut raw = if !is_fallback {
+        // Try regional provider first
+        match regional_provider.fetch_raw(bbox, grid_width, grid_height) {
+            Ok(mut r) => {
+                // Check for NaN gaps
+                let nan_ratio = compute_nan_ratio(&r.heights_meters);
+                if nan_ratio > 0.0 {
+                    // Has gaps: complement with AWS
+                    emit_gui_progress_update(16.5, "Filling elevation gaps with AWS fallback...");
+                    match AwsTerrain.fetch_raw(bbox, grid_width, grid_height) {
+                        Ok(aws_raw) => {
+                            let gap_count = merge_elevation_grids(&mut r.heights_meters, &aws_raw.heights_meters);
+                            println!(
+                                "Elevation: {} (primary{}) → {:.1}% coverage, {} gaps filled from AWS",
+                                provider_name,
+                                if nan_ratio == 0.0 { ", full coverage" } else { "" },
+                                (1.0 - nan_ratio) * 100.0,
+                                gap_count,
+                            );
+                            r
+                        }
+                        Err(_) => {
+                            // AWS also failed, use what we have
+                            println!(
+                                "Elevation: {} → {:.1}% coverage (AWS fallback unavailable)",
+                                provider_name,
+                                (1.0 - nan_ratio) * 100.0,
+                            );
+                            r
+                        }
+                    }
+                } else {
+                    // 0% NaN: complete coverage, no need for AWS
+                    println!("Elevation: {} → full coverage", provider_name);
+                    r
+                }
+            }
+            Err(e) => {
                 eprintln!(
-                    "Warning: Regional provider '{}' returned {:.0}% empty data. Falling back to AWS Terrain Tiles.",
-                    provider_name, nan_ratio * 100.0
+                    "Warning: Regional provider '{}' failed: {}. Falling back to AWS Terrain Tiles.",
+                    provider_name, e
                 );
                 #[cfg(feature = "gui")]
                 crate::telemetry::send_log(
                     crate::telemetry::LogLevel::Warning,
                     &format!(
-                        "Regional provider '{}' returned mostly empty data, using AWS fallback.",
+                        "Regional elevation provider '{}' failed, using AWS fallback.",
                         provider_name
                     ),
                 );
-                let fallback = providers::aws_terrain::AwsTerrain;
-                fallback.fetch_raw(bbox, grid_width, grid_height)?
-            } else {
-                raw
+                emit_gui_progress_update(16.0, "Regional provider failed, fetching from AWS...");
+                AwsTerrain.fetch_raw(bbox, grid_width, grid_height)?
             }
         }
-        Ok(raw) => raw,
-        Err(e) if !is_fallback => {
-            eprintln!(
-                "Warning: Regional provider '{}' failed: {}. Falling back to AWS Terrain Tiles.",
-                provider_name, e
-            );
-            #[cfg(feature = "gui")]
-            crate::telemetry::send_log(
-                crate::telemetry::LogLevel::Warning,
-                &format!(
-                    "Regional elevation provider '{}' failed, using AWS fallback.",
-                    provider_name
-                ),
-            );
-            let fallback = providers::aws_terrain::AwsTerrain;
-            emit_gui_progress_update(16.0, "Regional provider failed, fetching from AWS...");
-            fallback.fetch_raw(bbox, grid_width, grid_height)?
-        }
-        Err(e) => return Err(e),
+    } else {
+        // No regional provider: use AWS directly
+        emit_gui_progress_update(16.0, "Fetching elevation from AWS Terrain Tiles...");
+        AwsTerrain.fetch_raw(bbox, grid_width, grid_height)?
     };
 
     emit_gui_progress_update(17.0, "Processing elevation...");
@@ -275,4 +293,22 @@ fn compute_nan_ratio(heights: &[Vec<f64>]) -> f64 {
         return 1.0;
     }
     nan_count as f64 / total as f64
+}
+
+/// Merge two elevation grids: prefer `primary` where valid, fall back to `secondary`.
+/// Both grids must have the same dimensions.
+fn merge_elevation_grids(
+    primary: &mut Vec<Vec<f64>>,
+    secondary: &[Vec<f64>],
+) -> usize {
+    let mut gap_count = 0usize;
+    for (row_p, row_s) in primary.iter_mut().zip(secondary.iter()) {
+        for (p, s) in row_p.iter_mut().zip(row_s.iter()) {
+            if !p.is_finite() && s.is_finite() {
+                *p = *s;
+                gap_count += 1;
+            }
+        }
+    }
+    gap_count
 }
