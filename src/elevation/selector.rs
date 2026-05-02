@@ -106,9 +106,9 @@ mod tests {
 
     #[test]
     fn test_select_provider_fallback() {
-        // Bbox outside all regional coverage should fall back to AWS
+        // Bbox outside all regional coverage should fall back to Copernicus (best global provider)
         let bbox = LLBBox::new(-33.86, 151.20, -33.85, 151.22).unwrap();
         let provider = select_provider(&bbox);
-        assert_eq!(provider.name(), "aws");
+        assert_eq!(provider.name(), "copernicus_30m");
     }
 }

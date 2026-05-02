@@ -35,8 +35,12 @@ pub trait ElevationProvider: Send + Sync {
     ) -> Result<RawElevationGrid, Box<dyn std::error::Error>>;
 
     /// Clone this provider into a boxed trait object.
-    /// Default implementation returns None for types that don't implement Clone.
-    fn clone_box(&self) -> Box<dyn ElevationProvider> {
-        unimplemented!("clone_box not implemented for {}", self.name())
+    /// All implementations must provide this to allow cloning behind trait objects.
+    fn clone_box(&self) -> Box<dyn ElevationProvider>;
+}
+
+impl Clone for Box<dyn ElevationProvider> {
+    fn clone(&self) -> Self {
+        self.clone_box()
     }
 }
