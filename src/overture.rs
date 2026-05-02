@@ -2796,8 +2796,8 @@ mod tests {
         let way1 = ProcessedWay {
             id: 1,
             nodes: vec![
-                ProcessedNode { x: 0, y: 0, z: 0 },
-                ProcessedNode { x: 10, y: 0, z: 0 },
+                ProcessedNode { id: 0, x: 0, z: 0, tags: HashMap::new() },
+                ProcessedNode { id: 1, x: 10, z: 0, tags: HashMap::new() },
             ],
             tags: HashMap::new(),
         };
