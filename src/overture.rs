@@ -320,7 +320,7 @@ pub fn deduplicate_against_osm(
                 }
 
                 // Check if this is a water feature
-                if way.tags.contains_key("natural") && way.tags.get("natural") == Some(&"water".to_string())
+                if (way.tags.contains_key("natural") && way.tags.get("natural") == Some(&"water".to_string()))
                     || way.tags.contains_key("waterway")
                     || way.tags.contains_key("water")
                 {
