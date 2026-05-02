@@ -341,7 +341,7 @@ pub fn deduplicate_against_osm(
                 // Check if this is a landuse feature
                 if way.tags.contains_key("landuse") || way.tags.contains_key("leisure") {
                     if let Some(ref grid) = landuse_grid {
-                        if overlaps_with_grid(way, grid, &osm_landuse_bboxes, landuse_grid_min_x, landuse_grid_min_z) {
+                        if overlaps_with_grid(way, grid, &osm_landuse_bboxes, landuse_grid_min_x, landuse_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
