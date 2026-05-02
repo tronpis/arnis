@@ -304,7 +304,7 @@ pub fn deduplicate_against_osm(
                 // Check if this is a building
                 if way.tags.contains_key("building") || way.tags.contains_key("building:part") {
                     if let Some(ref grid) = building_grid {
-                        if overlaps_with_grid(way, grid, &osm_building_bboxes, building_grid_min_x, building_grid_min_z) {
+                        if overlaps_with_grid(way, grid, &osm_building_bboxes, building_grid_min_x, building_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
