@@ -64,8 +64,8 @@ impl ElevationProvider for CopernicusDem30 {
 
         // Collect all tile coordinates that overlap our bbox
         let mut tiles: Vec<(i32, i32)> = Vec::new();
-        for lat in (min_lat.floor() as i32)..=(max_lat.ceil() as i32) {
-            for lng in (min_lng.floor() as i32)..=(max_lng.ceil() as i32) {
+        for lat in (min_lat.floor() as i32)..=(max_lat.floor() as i32) {
+            for lng in (min_lng.floor() as i32)..=(max_lng.floor() as i32) {
                 tiles.push((lat, lng));
             }
         }
