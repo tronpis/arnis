@@ -331,7 +331,7 @@ pub fn deduplicate_against_osm(
                     || way.tags.contains_key("water")
                 {
                     if let Some(ref grid) = water_grid {
-                        if overlaps_with_grid(way, grid, &osm_water_bboxes, water_grid_min_x, water_grid_min_z) {
+                        if overlaps_with_grid(way, grid, &osm_water_bboxes, water_grid_min_x, water_grid_min_z, CELL_SIZE) {
                             return false;
                         }
                     }
