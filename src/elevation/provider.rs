@@ -38,3 +38,9 @@ pub trait ElevationProvider: Send + Sync {
     /// All implementations must provide this to allow cloning behind trait objects.
     fn clone_box(&self) -> Box<dyn ElevationProvider>;
 }
+
+impl Clone for Box<dyn ElevationProvider> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
