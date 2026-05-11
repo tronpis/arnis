@@ -390,6 +390,7 @@ fn overlaps_with_grid(
     bboxes: &[(i32, i32, i32, i32)],
     grid_min_x: i32,
     grid_min_z: i32,
+    cell_size: i32,
 ) -> bool {
     if way.nodes.is_empty() {
         return false;
@@ -1122,6 +1123,13 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
 ) -> Result<Vec<ProcessedElement>, Box<dyn std::error::Error>> {
     let row_group_reader = reader.get_row_group(rg_idx)?;
     let row_iter = row_group_reader.get_row_iter(None)?;
+    let bbox = LLBBox::new(
+        target_min_lat,
+        target_min_lng,
+        target_max_lat,
+        target_max_lng,
+    )
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
     match collection {
         OvertureCollection::Building => {
@@ -1145,7 +1153,8 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if b.is_osm_sourced {
                         return None;
                     }
-                    building_to_processed_way(&b, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    building_to_processed_way(&b, coord_transformer, &bbox)
+                        .map(ProcessedElement::Way)
                 })
                 .collect())
         }
@@ -1170,7 +1179,8 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if r.is_osm_sourced {
                         return None;
                     }
-                    road_to_processed_way(&r, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    road_to_processed_way(&r, coord_transformer, &bbox)
+                        .map(ProcessedElement::Way)
                 })
                 .collect())
         }
@@ -1195,7 +1205,8 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if w.is_osm_sourced {
                         return None;
                     }
-                    water_to_processed_way(&w, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    water_to_processed_way(&w, coord_transformer, &bbox)
+                        .map(ProcessedElement::Way)
                 })
                 .collect())
         }
@@ -1220,7 +1231,8 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
                     if l.is_osm_sourced {
                         return None;
                     }
-                    landuse_to_processed_way(&l, coord_transformer, &LLBBox::new_unchecked(target_min_lat, target_min_lng, target_max_lat, target_max_lng))
+                    landuse_to_processed_way(&l, coord_transformer, &bbox)
+                        .map(ProcessedElement::Way)
                 })
                 .collect())
         }

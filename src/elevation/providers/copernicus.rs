@@ -42,9 +42,9 @@ impl ElevationProvider for CopernicusDem30 {
         grid_height: usize,
     ) -> Result<RawElevationGrid, Box<dyn std::error::Error>> {
         use reqwest::blocking::Client;
-        use std::time::Duration;
-        use tiff::decoder::Decoder;
         use std::io::Cursor;
+        use std::time::Duration;
+        use tiff::decoder::{Decoder, DecodingResult};
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -145,12 +145,18 @@ impl ElevationProvider for CopernicusDem30 {
             let height = decoder.dimensions()?.1 as usize;
             tile_dims.insert((lat, lng), (width, height));
 
-            // Read the image data - Copernicus DEM uses 32-bit float
-            let mut buf = vec![0.0f32; width * height];
-            decoder.read_f32_into(&mut buf)?;
-
-            // Convert to f64 and store
-            let heights: Vec<f64> = buf.into_iter().map(|v| v as f64).collect();
+            // Read the image data - Copernicus DEM uses 32-bit float.
+            let heights: Vec<f64> = match decoder.read_image()? {
+                DecodingResult::F32(values) => values.into_iter().map(f64::from).collect(),
+                DecodingResult::F64(values) => values,
+                other => {
+                    return Err(format!(
+                        "Unsupported Copernicus DEM sample format: {:?}",
+                        other
+                    )
+                    .into());
+                }
+            };
             tile_data.insert((lat, lng), heights);
         }
 
