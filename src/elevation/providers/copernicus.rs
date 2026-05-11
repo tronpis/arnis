@@ -12,8 +12,36 @@ use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
 use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
 
+/// Lowest valid terrestrial elevation with margin; common DEM nodata sentinels are far lower.
+const MIN_VALID_ELEVATION_M: f64 = -9999.0;
+/// Upper sanity bound for DEM values; real Earth elevations are well below this.
+const MAX_VALID_ELEVATION_M: f64 = 100000.0;
+
 /// Copernicus DEM GLO-30 base URL on AWS S3
 const COPERNICUS_BASE_URL: &str = "https://copernicus-dem-30m.s3.amazonaws.com";
+
+fn normalize_elevation_sample(value: f64) -> f64 {
+    if value.is_finite() && value > MIN_VALID_ELEVATION_M && value < MAX_VALID_ELEVATION_M {
+        value
+    } else {
+        f64::NAN
+    }
+}
+
+fn overlapping_tile_range(min: f64, max: f64, min_tile: i32, max_tile: i32) -> std::ops::RangeInclusive<i32> {
+    let start = (min.floor() as i32).max(min_tile);
+    let end = (max.ceil() as i32 - 1).min(max_tile);
+    start..=end
+}
+
+fn overlapping_tiles(bbox: &LLBBox) -> Vec<(i32, i32)> {
+    let lats = overlapping_tile_range(bbox.min().lat(), bbox.max().lat(), -90, 89);
+    let lngs = overlapping_tile_range(bbox.min().lng(), bbox.max().lng(), -180, 179);
+
+    lats.into_iter()
+        .flat_map(|lat| lngs.iter().copied().map(move |lng| (lat, lng)))
+        .collect()
+}
 
 /// Copernicus DEM GLO-30 global coverage provider (~30m resolution).
 pub struct CopernicusDem30;
@@ -66,13 +94,10 @@ impl ElevationProvider for CopernicusDem30 {
         let min_lng = bbox.min().lng();
         let max_lng = bbox.max().lng();
 
-        // Collect all tile coordinates that overlap our bbox
-        let mut tiles: Vec<(i32, i32)> = Vec::new();
-        for lat in (min_lat.floor() as i32)..=(max_lat.floor() as i32) {
-            for lng in (min_lng.floor() as i32)..=(max_lng.floor() as i32) {
-                tiles.push((lat, lng));
-            }
-        }
+        // Collect all tile coordinates that overlap our bbox. Tile coordinates
+        // are 1° lower-left origins, so a bbox whose max edge lies exactly on
+        // an integer degree does not overlap the next tile.
+        let tiles = overlapping_tiles(bbox);
 
         println!(
             "Downloading {} Copernicus DEM tiles ({}m resolution)...",
@@ -98,10 +123,7 @@ impl ElevationProvider for CopernicusDem30 {
                 format!("W{:03}", lng.abs())
             };
 
-            let tile_name = format!(
-                "Copernicus_DSM_COG_10_{}_00_{}_00_DEM",
-                lat_str, lng_str
-            );
+            let tile_name = format!("Copernicus_DSM_COG_10_{}_00_{}_00_DEM", lat_str, lng_str);
             let tif_url = format!("{}/{}/{}.tif", COPERNICUS_BASE_URL, tile_name, tile_name);
             let cache_path = tile_cache_dir.join(format!("{}_{}.tiff", lat_str, lng_str));
 
@@ -131,7 +153,10 @@ impl ElevationProvider for CopernicusDem30 {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to download Copernicus tile {}: {}", tif_url, e);
+                        eprintln!(
+                            "Warning: Failed to download Copernicus tile {}: {}",
+                            tif_url, e
+                        );
                         continue;
                     }
                 }
@@ -145,16 +170,19 @@ impl ElevationProvider for CopernicusDem30 {
             let height = decoder.dimensions()?.1 as usize;
             tile_dims.insert((lat, lng), (width, height));
 
-            // Read the image data - Copernicus DEM uses 32-bit float.
+            // Read the image data - Copernicus DEM typically uses 32-bit float, but the decoder handles 64-bit as well.
             let heights: Vec<f64> = match decoder.read_image()? {
-                DecodingResult::F32(values) => values.into_iter().map(f64::from).collect(),
-                DecodingResult::F64(values) => values,
+                DecodingResult::F32(values) => values
+                    .into_iter()
+                    .map(|value| normalize_elevation_sample(f64::from(value)))
+                    .collect(),
+                DecodingResult::F64(values) => {
+                    values.into_iter().map(normalize_elevation_sample).collect()
+                }
                 other => {
-                    return Err(format!(
-                        "Unsupported Copernicus DEM sample format: {:?}",
-                        other
-                    )
-                    .into());
+                    return Err(
+                        format!("Unsupported Copernicus DEM sample format: {:?}", other).into(),
+                    );
                 }
             };
             tile_data.insert((lat, lng), heights);
@@ -231,5 +259,36 @@ mod tests {
     fn test_copernicus_resolution() {
         let provider = CopernicusDem30;
         assert!((provider.native_resolution_m() - 30.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_normalize_elevation_sample_keeps_valid_values() {
+        assert_eq!(normalize_elevation_sample(42.5), 42.5);
+        assert_eq!(normalize_elevation_sample(-430.0), -430.0);
+    }
+
+    #[test]
+    fn test_normalize_elevation_sample_filters_invalid_values() {
+        assert!(normalize_elevation_sample(f64::NAN).is_nan());
+        assert!(normalize_elevation_sample(f64::INFINITY).is_nan());
+        assert!(normalize_elevation_sample(-32767.0).is_nan());
+        assert!(normalize_elevation_sample(100000.0).is_nan());
+    }
+
+    #[test]
+    fn test_overlapping_tiles_excludes_integer_max_edge() {
+        let bbox = LLBBox::new(10.25, 20.25, 11.0, 21.0).unwrap();
+        assert_eq!(overlapping_tiles(&bbox), vec![(10, 20)]);
+    }
+
+    #[test]
+    fn test_overlapping_tiles_clamps_global_edges() {
+        let bbox = LLBBox::new(-90.0, -180.0, 90.0, 180.0).unwrap();
+        let tiles = overlapping_tiles(&bbox);
+
+        assert_eq!(tiles.len(), 180 * 360);
+        assert!(tiles.contains(&(-90, -180)));
+        assert!(tiles.contains(&(89, 179)));
+        assert!(!tiles.contains(&(90, 180)));
     }
 }
