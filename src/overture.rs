@@ -678,7 +678,7 @@ fn process_partition_file_by_collection(
         .filter_map(|element| {
             if let ProcessedElement::Way(mut way) = element {
                 let clipped = clip_way_to_bbox(&way.nodes, &xzbbox);
-                if clipped.len() < 3 {
+                if clipped.len() < min_clipped_node_count(&way) {
                     return None;
                 }
                 way.nodes = clipped;
@@ -690,6 +690,14 @@ fn process_partition_file_by_collection(
         .collect();
 
     Ok(clipped_elements)
+}
+
+fn min_clipped_node_count(way: &ProcessedWay) -> usize {
+    if way.tags.contains_key("highway") {
+        2
+    } else {
+        3
+    }
 }
 
 /// List partition file URLs that overlap the target bbox.
@@ -2847,6 +2855,33 @@ mod tests {
 
         // Threshold of 2 should not detect closeness
         assert!(!ways_are_close(&way1, &way2, 2));
+    }
+
+    #[test]
+    fn test_min_clipped_node_count_keeps_two_node_roads() {
+        use crate::osm_parser::ProcessedNode;
+
+        let road = ProcessedWay {
+            id: 1,
+            nodes: vec![
+                ProcessedNode { id: 0, x: 0, z: 0, tags: HashMap::new() },
+                ProcessedNode { id: 1, x: 10, z: 0, tags: HashMap::new() },
+            ],
+            tags: HashMap::from([("highway".to_string(), "residential".to_string())]),
+        };
+
+        let building = ProcessedWay {
+            id: 2,
+            nodes: vec![
+                ProcessedNode { id: 0, x: 0, z: 0, tags: HashMap::new() },
+                ProcessedNode { id: 1, x: 10, z: 0, tags: HashMap::new() },
+                ProcessedNode { id: 2, x: 10, z: 10, tags: HashMap::new() },
+            ],
+            tags: HashMap::from([("building".to_string(), "yes".to_string())]),
+        };
+
+        assert_eq!(min_clipped_node_count(&road), 2);
+        assert_eq!(min_clipped_node_count(&building), 3);
     }
 
     #[test]
