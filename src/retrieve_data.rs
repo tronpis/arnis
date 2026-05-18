@@ -10,10 +10,98 @@ use reqwest::blocking::Client;
 use reqwest::blocking::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, Cursor, Write};
+use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+const OVERPASS_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Compute a stable-enough cache key for an Overpass query and bbox.
+fn overpass_cache_key(bbox: &LLBBox, query: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    format!(
+        "{:.6}_{:.6}_{:.6}_{:.6}",
+        bbox.min().lat(),
+        bbox.min().lng(),
+        bbox.max().lat(),
+        bbox.max().lng()
+    )
+    .hash(&mut hasher);
+    query.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Returns the cache directory for Overpass data.
+fn overpass_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("arnis")
+        .join("overpass_cache")
+}
+
+/// Check if a cached Overpass response exists and is still fresh.
+fn load_cached_overpass(key: &str) -> Option<String> {
+    let path = overpass_cache_dir().join(format!("{key}.json"));
+    if !path.exists() {
+        return None;
+    }
+
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        if let Ok(modified) = metadata.modified() {
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if age > OVERPASS_CACHE_MAX_AGE {
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+        }
+    }
+
+    std::fs::read_to_string(&path).ok()
+}
+
+fn save_overpass_cache(key: &str, data: &str) {
+    let dir = overpass_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let path = dir.join(format!("{key}.json"));
+    let _ = std::fs::write(path, data);
+}
+
+/// Remove stale Overpass cache files.
+pub fn cleanup_old_overpass_cache() {
+    let dir = overpass_cache_dir();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age > OVERPASS_CACHE_MAX_AGE {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 /// Extract the host portion of a URL for telemetry
 fn url_host(url: &str) -> String {
@@ -127,6 +215,7 @@ pub fn fetch_data_from_overpass(
     debug: bool,
     download_method: &str,
     save_file: Option<&str>,
+    use_cache: bool,
 ) -> Result<OsmData, Box<dyn std::error::Error>> {
     println!("{} Fetching data...", "[1/7]".bold());
     emit_gui_progress_update(1.0, "Fetching data...");
@@ -190,6 +279,18 @@ pub fn fetch_data_from_overpass(
         bbox.max().lat(),
         bbox.max().lng(),
     );
+
+    let cache_key = overpass_cache_key(&bbox, &query);
+    if use_cache {
+        if let Some(cached_response) = load_cached_overpass(&cache_key) {
+            println!("  Using cached Overpass data ({cache_key})");
+            emit_gui_progress_update(5.0, "Using cached Overpass data...");
+            let mut deserializer =
+                serde_json::Deserializer::from_reader(Cursor::new(cached_response.as_bytes()));
+            let data: OsmData = OsmData::deserialize(&mut deserializer)?;
+            return Ok(data);
+        }
+    }
 
     {
         // Fetch data from Overpass API.
@@ -339,6 +440,10 @@ pub fn fetch_data_from_overpass(
             } else {
                 return Err("Data fetch failed".into());
             }
+        }
+
+        if use_cache {
+            save_overpass_cache(&cache_key, &response);
         }
 
         emit_gui_progress_update(5.0, "");

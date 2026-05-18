@@ -63,6 +63,18 @@ pub struct Args {
     #[arg(long = "land-cover", alias = "city-boundaries", default_value_t = true, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub land_cover: bool,
 
+    /// Cache Overpass API responses for 7 days (speeds up repeated generation of the same area)
+    #[arg(
+        long = "use-cache",
+        alias = "use-overpass-cache",
+        default_value_t = false
+    )]
+    pub use_overpass_cache: bool,
+
+    /// Disable Overpass API response caching, overriding --use-cache if both are provided
+    #[arg(long = "no-cache", default_value_t = false)]
+    pub no_overpass_cache: bool,
+
     /// Enable debug mode (optional)
     #[arg(long)]
     pub debug: bool,
@@ -193,6 +205,8 @@ mod tests {
         assert!(!args.terrain);
         assert!(!args.bedrock);
         assert!(!args.disable_height_limit);
+        assert!(!args.use_overpass_cache);
+        assert!(!args.no_overpass_cache);
         // interior, roof, land_cover default to true
         assert!(args.interior);
         assert!(args.roof);
@@ -247,6 +261,37 @@ mod tests {
         ];
         let args = Args::parse_from(cmd.iter());
         assert!(!args.land_cover);
+    }
+
+    #[test]
+    fn test_overpass_cache_flags() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+
+        let cmd = [
+            "arnis",
+            "--output-dir",
+            tmp_path,
+            "--bbox",
+            "1,2,3,4",
+            "--use-cache",
+        ];
+        let args = Args::parse_from(cmd.iter());
+        assert!(args.use_overpass_cache);
+        assert!(!args.no_overpass_cache);
+
+        let cmd = [
+            "arnis",
+            "--output-dir",
+            tmp_path,
+            "--bbox",
+            "1,2,3,4",
+            "--use-cache",
+            "--no-cache",
+        ];
+        let args = Args::parse_from(cmd.iter());
+        assert!(args.use_overpass_cache);
+        assert!(args.no_overpass_cache);
     }
 
     #[test]

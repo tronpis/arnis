@@ -50,9 +50,15 @@
               </div>
             </div>
             <span id="bbox-selection-info" class="bbox-selection-text" data-localize="select_area_prompt">Select an area on the map using the tools.</span>
+            <div id="generation-estimate" style="font-size: 0.85em; color: #aaa; margin-top: 8px;">
+              <div>⏱ <span id="estimate-time">–</span></div>
+              <div>💾 <span id="estimate-disk">–</span></div>
+              <div>📐 <span id="estimate-size">–</span></div>
+            </div>
           </div>
 
           <div class="progress-section">
+            <div id="coverage-warning-banner" style="display:none; background:#7a3f00; color:#ffcc80; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-size:0.85em;"></div>
             <img src="" alt="" class="secret-parrot" id="secret-parrot">
             <span id="progress-info" class="progress-info-text"></span>
             <div class="progress-row">
@@ -134,6 +140,17 @@
           </label>
           <div class="settings-control">
             <input type="checkbox" id="land-cover-toggle" name="land-cover-toggle" checked>
+          </div>
+        </div>
+
+        <!-- Overpass Cache Toggle -->
+        <div class="settings-row">
+          <label for="overpass-cache-toggle">
+            <span>Overpass Cache</span>
+            <span class="tooltip-icon" data-tooltip="Cache Overpass API responses for 7 days to speed up repeated generation of the same area.">?</span>
+          </label>
+          <div class="settings-control">
+            <input type="checkbox" id="overpass-cache-toggle" name="overpass-cache-toggle">
           </div>
         </div>
 
