@@ -2042,7 +2042,7 @@ fn building_to_processed_way(
     coord_transformer: &CoordTransformer,
     bbox: &LLBBox,
 ) -> Option<ProcessedWay> {
-    let base_id = gers_id_to_u64(&building.id).wrapping_add((building.part_index as u64) << 32);
+    let base_id = (gers_id_to_u64(&building.id) & !OVERTURE_ID_HIGH_BIT).wrapping_add((building.part_index as u64) << 32) | OVERTURE_ID_HIGH_BIT;
 
     // Convert coordinates to Minecraft XZ
     let mut nodes: Vec<ProcessedNode> = Vec::with_capacity(building.exterior_ring.len());
