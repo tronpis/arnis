@@ -3,8 +3,10 @@ use crate::coordinate_system::cartesian::{XZBBox, XZPoint};
 use crate::coordinate_system::geographic::{LLBBox, LLPoint};
 use crate::coordinate_system::transformation::CoordTransformer;
 use crate::data_processing::{self, GenerationOptions};
+use crate::estimation;
 use crate::ground::{self, Ground};
 use crate::map_transformation;
+use crate::osm_coverage;
 use crate::osm_parser;
 use crate::overture;
 use crate::progress::{self, emit_gui_progress_update};
@@ -21,6 +23,7 @@ use rfd::FileDialog;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io::Write};
+use tauri::{Emitter, Manager};
 use tauri_plugin_log::{Builder as LogBuilder, Target, TargetKind};
 
 /// Manages the session.lock file for a Minecraft world directory
@@ -106,6 +109,7 @@ pub fn run_gui() {
 
     // Clean up old cached elevation tiles on startup
     crate::elevation_data::cleanup_old_cached_tiles();
+    crate::retrieve_data::cleanup_old_overpass_cache();
 
     // Launch the UI
     println!("Launching UI...");
@@ -148,6 +152,7 @@ pub fn run_gui() {
             gui_set_save_path,
             gui_pick_save_directory,
             gui_start_generation,
+            gui_estimate_generation,
             gui_get_version,
             gui_check_for_updates,
             gui_clear_tile_caches,
@@ -787,9 +792,28 @@ fn gui_show_in_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn gui_estimate_generation(
+    bbox_text: String,
+    world_scale: f64,
+    terrain_enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let bbox = LLBBox::from_str(&bbox_text).map_err(|e| format!("Invalid bbox: {e}"))?;
+    let est = estimation::estimate_generation(&bbox, world_scale, terrain_enabled);
+    Ok(serde_json::json!({
+        "timeMinSec": est.time_seconds_min,
+        "timeMaxSec": est.time_seconds_max,
+        "diskMbMin": est.disk_mb_min,
+        "diskMbMax": est.disk_mb_max,
+        "worldBlocksX": est.world_blocks_x,
+        "worldBlocksZ": est.world_blocks_z,
+    }))
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_variables)]
 fn gui_start_generation(
+    app_handle: tauri::AppHandle,
     bbox_text: String,
     selected_world: String,
     world_scale: f64,
@@ -800,6 +824,7 @@ fn gui_start_generation(
     roof_enabled: bool,
     fillground_enabled: bool,
     land_cover_enabled: bool, // renamed from city_boundaries_enabled
+    use_overpass_cache: bool,
     disable_height_limit: bool,
     is_new_world: bool,
     spawn_point: Option<(f64, f64)>,
@@ -869,6 +894,7 @@ fn gui_start_generation(
 
     tauri::async_runtime::spawn(async move {
         if let Err(e) = tokio::task::spawn_blocking(move || {
+            let app_handle = app_handle.clone();
             let world_path = PathBuf::from(&selected_world);
 
             // Determine world format from UI selection first (needed for session lock decision)
@@ -1012,6 +1038,8 @@ fn gui_start_generation(
                 roof: roof_enabled,
                 fillground: fillground_enabled,
                 land_cover: land_cover_enabled,
+                use_overpass_cache,
+                no_overpass_cache: false,
                 debug: false,
                 timeout: Some(std::time::Duration::from_secs(40)),
                 spawn_lat: None,
@@ -1062,10 +1090,47 @@ fn gui_start_generation(
             }
 
             // Run data fetch and world generation (standard mode: objects + terrain, or objects only)
-            match retrieve_data::fetch_data_from_overpass(args.bbox, args.debug, "requests", None) {
+            match retrieve_data::fetch_data_from_overpass(
+                args.bbox,
+                args.debug,
+                "requests",
+                None,
+                args.use_overpass_cache && !args.no_overpass_cache,
+            ) {
                 Ok(raw_data) => {
                     let (mut parsed_elements, mut xzbbox) =
                         osm_parser::parse_osm_data(raw_data, args.bbox, args.scale, args.debug);
+
+                    let coverage = osm_coverage::assess_osm_coverage(&parsed_elements, &args.bbox);
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.emit(
+                            "osm-coverage-warning",
+                            serde_json::json!({
+                                "level": coverage.coverage_level.as_str(),
+                                "buildingCount": coverage.building_count,
+                                "roadCount": coverage.road_count,
+                                "buildingsPerKm2": coverage.buildings_per_km2,
+                                "roadsPerKm2": coverage.roads_per_km2,
+                                "areaKm2": coverage.area_km2,
+                            }),
+                        );
+                    }
+                    match coverage.coverage_level {
+                        osm_coverage::CoverageLevel::VeryLow => eprintln!(
+                            "{}",
+                            format!(
+                                "Warning: Very low OSM coverage ({} buildings in {:.1} km²). The generated world may be mostly empty.",
+                                coverage.building_count, coverage.area_km2
+                            )
+                            .yellow()
+                            .bold()
+                        ),
+                        osm_coverage::CoverageLevel::Low => println!(
+                            "Note: Low OSM coverage ({:.0} buildings/km²). Adding Overture Maps data may help.",
+                            coverage.buildings_per_km2
+                        ),
+                        _ => {}
+                    }
 
                     // Fetch supplementary building data from Overture Maps
                     {

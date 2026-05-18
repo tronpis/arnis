@@ -89,6 +89,8 @@ struct OvertureBuilding {
     id: String,
     /// Exterior ring coordinates as (longitude, latitude) pairs
     exterior_ring: Vec<(f64, f64)>,
+    /// MultiPolygon part index used to derive stable per-part IDs.
+    part_index: u32,
     /// Whether the primary source is OpenStreetMap
     is_osm_sourced: bool,
     /// Building height in meters (if available)
@@ -1144,14 +1146,14 @@ fn parse_row_group_by_collection<R: ChunkReader + 'static>(
             let mut buildings: Vec<OvertureBuilding> = Vec::new();
             for row_result in row_iter {
                 let row = row_result?;
-                if let Some(building) = parse_overture_row(
+                if let Some(row_buildings) = parse_overture_row(
                     &row,
                     target_min_lng,
                     target_max_lng,
                     target_min_lat,
                     target_max_lat,
                 ) {
-                    buildings.push(building);
+                    buildings.extend(row_buildings);
                 }
             }
             Ok(buildings
@@ -1263,14 +1265,14 @@ fn parse_row_group<R: ChunkReader + 'static>(
 
     for row_result in row_iter {
         let row = row_result?;
-        if let Some(building) = parse_overture_row(
+        if let Some(row_buildings) = parse_overture_row(
             &row,
             target_min_lng,
             target_max_lng,
             target_min_lat,
             target_max_lat,
         ) {
-            buildings.push(building);
+            buildings.extend(row_buildings);
         }
     }
 
@@ -1287,7 +1289,7 @@ fn parse_overture_row(
     target_max_lng: f64,
     target_min_lat: f64,
     target_max_lat: f64,
-) -> Option<OvertureBuilding> {
+) -> Option<Vec<OvertureBuilding>> {
     let mut id: Option<String> = None;
     let mut geometry_bytes: Option<Vec<u8>> = None;
     let mut sources_str: Option<String> = None;
@@ -1417,10 +1419,7 @@ fn parse_overture_row(
 
     // Parse geometry
     let geometry_bytes = geometry_bytes?;
-    let exterior_ring = parse_wkb_polygon(&geometry_bytes)?;
-    if exterior_ring.len() < 3 {
-        return None;
-    }
+    let exterior_rings = parse_wkb_geometry_exterior_rings(&geometry_bytes)?;
 
     // Check if primary source is OSM
     let is_osm = sources_str
@@ -1430,21 +1429,33 @@ fn parse_overture_row(
 
     let id = id?;
 
-    Some(OvertureBuilding {
-        id,
-        exterior_ring,
-        is_osm_sourced: is_osm,
-        height,
-        min_height,
-        num_floors,
-        subtype,
-        class,
-        roof_shape,
-        roof_material,
-        roof_orientation,
-        facade_color,
-        roof_color,
-    })
+    let buildings: Vec<OvertureBuilding> = exterior_rings
+        .into_iter()
+        .enumerate()
+        .filter(|(_, exterior_ring)| exterior_ring.len() >= 3)
+        .map(|(part_index, exterior_ring)| OvertureBuilding {
+            id: id.clone(),
+            exterior_ring,
+            part_index: part_index as u32,
+            is_osm_sourced: is_osm,
+            height,
+            min_height,
+            num_floors,
+            subtype: subtype.clone(),
+            class: class.clone(),
+            roof_shape: roof_shape.clone(),
+            roof_material: roof_material.clone(),
+            roof_orientation: roof_orientation.clone(),
+            facade_color: facade_color.clone(),
+            roof_color: roof_color.clone(),
+        })
+        .collect();
+
+    if buildings.is_empty() {
+        None
+    } else {
+        Some(buildings)
+    }
 }
 
 /// Parse a single Parquet row into an OvertureRoad.
@@ -1875,139 +1886,154 @@ fn parse_wkb_linestring(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
     Some(coords)
 }
 
-/// Parse WKB (Well-Known Binary) Polygon geometry into coordinate pairs.
-///
-/// Returns the exterior ring as a sequence of (longitude, latitude) pairs.
-/// Supports both little-endian and big-endian byte order.
-/// Only handles Polygon type (WKB type 3). MultiPolygon or other types are skipped.
-fn parse_wkb_polygon(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
-    if wkb.len() < 13 {
-        // Minimum: 1 (byte order) + 4 (type) + 4 (num rings) + 4 (num points in ring)
-        return None;
-    }
-
-    let byte_order = wkb[0];
-    // WKB only defines 0 (big-endian) and 1 (little-endian)
-    if byte_order > 1 {
-        return None;
-    }
-    let is_le = byte_order == 1;
-
-    let geom_type = if is_le {
-        u32::from_le_bytes([wkb[1], wkb[2], wkb[3], wkb[4]])
+fn read_wkb_u32(wkb: &[u8], offset: usize, is_le: bool) -> Option<u32> {
+    let bytes: [u8; 4] = wkb.get(offset..offset + 4)?.try_into().ok()?;
+    Some(if is_le {
+        u32::from_le_bytes(bytes)
     } else {
-        u32::from_be_bytes([wkb[1], wkb[2], wkb[3], wkb[4]])
-    };
+        u32::from_be_bytes(bytes)
+    })
+}
 
-    // Type 3 = Polygon. ISO WKB uses offsets: +1000 for Z, +2000 for M, +3000 for ZM.
-    // Use modulo to extract the base type correctly for all dimension variants.
-    let base_type = geom_type % 1000;
-    if base_type != 3 {
-        return None; // Not a Polygon
-    }
-
-    let num_rings = if is_le {
-        u32::from_le_bytes([wkb[5], wkb[6], wkb[7], wkb[8]])
+fn read_wkb_f64(wkb: &[u8], offset: usize, is_le: bool) -> Option<f64> {
+    let bytes: [u8; 8] = wkb.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if is_le {
+        f64::from_le_bytes(bytes)
     } else {
-        u32::from_be_bytes([wkb[5], wkb[6], wkb[7], wkb[8]])
-    };
+        f64::from_be_bytes(bytes)
+    })
+}
 
-    if num_rings == 0 {
-        return None;
-    }
+fn wkb_point_size(geom_type: u32) -> usize {
+    let dimensions = geom_type / 1000;
+    let has_z = dimensions == 1 || dimensions == 3;
+    let has_m = dimensions == 2 || dimensions == 3;
+    16 + if has_z { 8 } else { 0 } + if has_m { 8 } else { 0 }
+}
 
-    // Parse the exterior ring (first ring)
-    let mut offset = 9;
-    if offset + 4 > wkb.len() {
-        return None;
-    }
-
-    let num_points = if is_le {
-        u32::from_le_bytes([
-            wkb[offset],
-            wkb[offset + 1],
-            wkb[offset + 2],
-            wkb[offset + 3],
-        ])
-    } else {
-        u32::from_be_bytes([
-            wkb[offset],
-            wkb[offset + 1],
-            wkb[offset + 2],
-            wkb[offset + 3],
-        ])
-    };
+fn parse_wkb_ring(
+    wkb: &[u8],
+    mut offset: usize,
+    is_le: bool,
+    point_size: usize,
+) -> Option<(Vec<(f64, f64)>, usize)> {
+    let num_points = read_wkb_u32(wkb, offset, is_le)?;
     offset += 4;
 
-    // Validate num_points to prevent resource exhaustion from malformed WKB
+    // Validate num_points to prevent resource exhaustion from malformed WKB.
     const MAX_POINTS: u32 = 10_000_000;
     if num_points == 0 || num_points > MAX_POINTS {
         return None;
     }
 
-    // Determine point stride (2D = 16 bytes, 3D = 24 bytes, etc.)
-    let has_z = (geom_type / 1000) == 1 || (geom_type / 1000) == 3;
-    let has_m = (geom_type / 1000) == 2 || (geom_type / 1000) == 3;
-    let point_size: usize = 16 + if has_z { 8 } else { 0 } + if has_m { 8 } else { 0 };
-
     let needed = num_points as usize * point_size;
     if offset + needed > wkb.len() {
-        return None; // Buffer doesn't contain enough data for claimed number of points
+        return None;
     }
 
     let mut coords = Vec::with_capacity(num_points as usize);
     for _ in 0..num_points {
-        let x = if is_le {
-            f64::from_le_bytes([
-                wkb[offset],
-                wkb[offset + 1],
-                wkb[offset + 2],
-                wkb[offset + 3],
-                wkb[offset + 4],
-                wkb[offset + 5],
-                wkb[offset + 6],
-                wkb[offset + 7],
-            ])
-        } else {
-            f64::from_be_bytes([
-                wkb[offset],
-                wkb[offset + 1],
-                wkb[offset + 2],
-                wkb[offset + 3],
-                wkb[offset + 4],
-                wkb[offset + 5],
-                wkb[offset + 6],
-                wkb[offset + 7],
-            ])
-        };
-        let y = if is_le {
-            f64::from_le_bytes([
-                wkb[offset + 8],
-                wkb[offset + 9],
-                wkb[offset + 10],
-                wkb[offset + 11],
-                wkb[offset + 12],
-                wkb[offset + 13],
-                wkb[offset + 14],
-                wkb[offset + 15],
-            ])
-        } else {
-            f64::from_be_bytes([
-                wkb[offset + 8],
-                wkb[offset + 9],
-                wkb[offset + 10],
-                wkb[offset + 11],
-                wkb[offset + 12],
-                wkb[offset + 13],
-                wkb[offset + 14],
-                wkb[offset + 15],
-            ])
-        };
+        let x = read_wkb_f64(wkb, offset, is_le)?;
+        let y = read_wkb_f64(wkb, offset + 8, is_le)?;
         offset += point_size;
         coords.push((x, y)); // (longitude, latitude)
     }
 
-    Some(coords)
+    Some((coords, offset))
+}
+
+fn parse_polygon_at_offset(wkb: &[u8], offset: usize) -> Option<(Vec<(f64, f64)>, usize)> {
+    if offset + 13 > wkb.len() {
+        return None;
+    }
+
+    let byte_order = *wkb.get(offset)?;
+    if byte_order > 1 {
+        return None;
+    }
+    let is_le = byte_order == 1;
+    let geom_type = read_wkb_u32(wkb, offset + 1, is_le)?;
+
+    // Type 3 = Polygon. ISO WKB uses offsets: +1000 for Z, +2000 for M, +3000 for ZM.
+    // Use modulo to extract the base type correctly for all dimension variants.
+    if geom_type % 1000 != 3 {
+        return None;
+    }
+
+    let num_rings = read_wkb_u32(wkb, offset + 5, is_le)?;
+    if num_rings == 0 {
+        return None;
+    }
+
+    let point_size = wkb_point_size(geom_type);
+    let mut ring_offset = offset + 9;
+    let (exterior_ring, next_offset) = parse_wkb_ring(wkb, ring_offset, is_le, point_size)?;
+    ring_offset = next_offset;
+
+    // Consume interior rings so callers can continue parsing subsequent polygons.
+    for _ in 1..num_rings {
+        let (_, next_offset) = parse_wkb_ring(wkb, ring_offset, is_le, point_size)?;
+        ring_offset = next_offset;
+    }
+
+    Some((exterior_ring, ring_offset))
+}
+
+/// Parse WKB (Well-Known Binary) Polygon geometry into coordinate pairs.
+///
+/// Returns the exterior ring as a sequence of (longitude, latitude) pairs.
+/// Supports both little-endian and big-endian byte order.
+/// Handles Polygon type (3) and dimensional variants such as PolygonZ (1003).
+fn parse_wkb_polygon(wkb: &[u8]) -> Option<Vec<(f64, f64)>> {
+    parse_polygon_at_offset(wkb, 0).map(|(ring, _)| ring)
+}
+
+/// Parse WKB MultiPolygon geometry into exterior rings, one per polygon part.
+///
+/// Each ring is returned as (longitude, latitude) pairs. Supports MultiPolygon
+/// type (6) and dimensional variants such as MultiPolygonZ (1006).
+fn parse_wkb_multipolygon(wkb: &[u8]) -> Option<Vec<Vec<(f64, f64)>>> {
+    if wkb.len() < 9 {
+        return None;
+    }
+
+    let byte_order = wkb[0];
+    if byte_order > 1 {
+        return None;
+    }
+    let is_le = byte_order == 1;
+    let geom_type = read_wkb_u32(wkb, 1, is_le)?;
+    if geom_type % 1000 != 6 {
+        return None;
+    }
+
+    let num_polygons = read_wkb_u32(wkb, 5, is_le)?;
+    if num_polygons == 0 {
+        return None;
+    }
+
+    const MAX_POLYGONS: u32 = 1_000_000;
+    if num_polygons > MAX_POLYGONS {
+        return None;
+    }
+
+    let mut rings = Vec::with_capacity(num_polygons as usize);
+    let mut offset = 9;
+    for _ in 0..num_polygons {
+        let (ring, next_offset) = parse_polygon_at_offset(wkb, offset)?;
+        rings.push(ring);
+        offset = next_offset;
+    }
+
+    Some(rings)
+}
+
+fn parse_wkb_geometry_exterior_rings(wkb: &[u8]) -> Option<Vec<Vec<(f64, f64)>>> {
+    if let Some(ring) = parse_wkb_polygon(wkb) {
+        return Some(vec![ring]);
+    }
+
+    parse_wkb_multipolygon(wkb)
 }
 
 /// Convert an Overture building to a ProcessedWay with OSM-compatible tags.
@@ -2016,7 +2042,7 @@ fn building_to_processed_way(
     coord_transformer: &CoordTransformer,
     bbox: &LLBBox,
 ) -> Option<ProcessedWay> {
-    let base_id = gers_id_to_u64(&building.id);
+    let base_id = (gers_id_to_u64(&building.id) & !OVERTURE_ID_HIGH_BIT).wrapping_add((building.part_index as u64) << 32) | OVERTURE_ID_HIGH_BIT;
 
     // Convert coordinates to Minecraft XZ
     let mut nodes: Vec<ProcessedNode> = Vec::with_capacity(building.exterior_ring.len());
@@ -2752,6 +2778,61 @@ mod tests {
         assert_eq!(coords.len(), 4);
         assert_eq!(coords[0], (10.0, 20.0)); // Z is ignored
         assert_eq!(coords[1], (11.0, 20.0));
+    }
+
+    fn append_polygon_wkb_le(
+        wkb: &mut Vec<u8>,
+        geom_type: u32,
+        coords: &[(f64, f64)],
+        z: Option<f64>,
+    ) {
+        wkb.push(1u8);
+        wkb.extend_from_slice(&geom_type.to_le_bytes());
+        wkb.extend_from_slice(&1u32.to_le_bytes());
+        wkb.extend_from_slice(&(coords.len() as u32).to_le_bytes());
+        for &(lng, lat) in coords {
+            wkb.extend_from_slice(&lng.to_le_bytes());
+            wkb.extend_from_slice(&lat.to_le_bytes());
+            if let Some(z) = z {
+                wkb.extend_from_slice(&z.to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_wkb_multipolygon_two_parts() {
+        let part1 = [(10.0, 20.0), (11.0, 20.0), (10.0, 21.0)];
+        let part2 = [(30.0, 40.0), (31.0, 40.0), (30.0, 41.0)];
+
+        let mut wkb = Vec::new();
+        wkb.push(1u8); // LE
+        wkb.extend_from_slice(&6u32.to_le_bytes()); // MultiPolygon
+        wkb.extend_from_slice(&2u32.to_le_bytes()); // 2 polygons
+        append_polygon_wkb_le(&mut wkb, 3, &part1, None);
+        append_polygon_wkb_le(&mut wkb, 3, &part2, None);
+
+        let rings = parse_wkb_multipolygon(&wkb).unwrap();
+        assert_eq!(rings.len(), 2);
+        assert_eq!(rings[0], part1);
+        assert_eq!(rings[1], part2);
+
+        let generic_rings = parse_wkb_geometry_exterior_rings(&wkb).unwrap();
+        assert_eq!(generic_rings, rings);
+    }
+
+    #[test]
+    fn test_parse_wkb_multipolygon_z() {
+        let part = [(10.0, 20.0), (11.0, 20.0), (10.0, 21.0)];
+
+        let mut wkb = Vec::new();
+        wkb.push(1u8); // LE
+        wkb.extend_from_slice(&1006u32.to_le_bytes()); // MultiPolygonZ
+        wkb.extend_from_slice(&1u32.to_le_bytes()); // 1 polygon
+        append_polygon_wkb_le(&mut wkb, 1003, &part, Some(100.0));
+
+        let rings = parse_wkb_multipolygon(&wkb).unwrap();
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0], part);
     }
 
     #[test]

@@ -28,7 +28,12 @@ fn normalize_elevation_sample(value: f64) -> f64 {
     }
 }
 
-fn overlapping_tile_range(min: f64, max: f64, min_tile: i32, max_tile: i32) -> std::ops::RangeInclusive<i32> {
+fn overlapping_tile_range(
+    min: f64,
+    max: f64,
+    min_tile: i32,
+    max_tile: i32,
+) -> std::ops::RangeInclusive<i32> {
     let start = (min.floor() as i32).max(min_tile);
     let end = (max.ceil() as i32 - 1).min(max_tile);
     start..=end
@@ -38,8 +43,7 @@ fn overlapping_tiles(bbox: &LLBBox) -> Vec<(i32, i32)> {
     let lats = overlapping_tile_range(bbox.min().lat(), bbox.max().lat(), -90, 89);
     let lngs = overlapping_tile_range(bbox.min().lng(), bbox.max().lng(), -180, 179);
 
-    lats.into_iter()
-        .flat_map(|lat| lngs.iter().copied().map(move |lng| (lat, lng)))
+    lats.flat_map(|lat| lngs.clone().map(move |lng| (lat, lng)))
         .collect()
 }
 

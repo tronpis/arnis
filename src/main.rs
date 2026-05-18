@@ -13,6 +13,7 @@ mod deterministic_rng;
 mod element_processing;
 mod elevation;
 mod elevation_data;
+mod estimation;
 mod floodfill;
 mod floodfill_cache;
 mod ground;
@@ -20,6 +21,7 @@ mod ground_generation;
 mod land_cover;
 mod map_renderer;
 mod map_transformation;
+mod osm_coverage;
 mod osm_parser;
 mod overture;
 #[cfg(feature = "gui")]
@@ -60,8 +62,9 @@ fn run_cli() {
     // Configure thread pool with 90% CPU cap to keep system responsive
     floodfill_cache::configure_rayon_thread_pool(0.9);
 
-    // Clean up old cached elevation tiles on startup
+    // Clean up old cached data on startup
     elevation_data::cleanup_old_cached_tiles();
+    retrieve_data::cleanup_old_overpass_cache();
 
     let version: &str = env!("CARGO_PKG_VERSION");
     let repository: &str = env!("CARGO_PKG_REPOSITORY");
@@ -110,6 +113,17 @@ fn run_cli() {
         );
         std::process::exit(1);
     }
+
+    let estimate = estimation::estimate_generation(&args.bbox, args.scale, args.terrain);
+    println!(
+        "Estimated generation: {}-{}s, {}-{} MB, {} x {} blocks",
+        estimate.time_seconds_min,
+        estimate.time_seconds_max,
+        estimate.disk_mb_min,
+        estimate.disk_mb_max,
+        estimate.world_blocks_x,
+        estimate.world_blocks_z
+    );
 
     // Determine world format and output path
     let world_format = if args.bedrock {
@@ -166,6 +180,7 @@ fn run_cli() {
             args.debug,
             args.downloader.as_str(),
             args.save_json_file.as_deref(),
+            args.use_overpass_cache && !args.no_overpass_cache,
         ),
     }
     .expect("Failed to fetch data");
@@ -175,6 +190,25 @@ fn run_cli() {
     // Parse raw data
     let (mut parsed_elements, mut xzbbox) =
         osm_parser::parse_osm_data(raw_data, args.bbox, args.scale, args.debug);
+
+    let coverage = osm_coverage::assess_osm_coverage(&parsed_elements, &args.bbox);
+    match coverage.coverage_level {
+        osm_coverage::CoverageLevel::VeryLow => {
+            let msg = format!(
+                "Warning: Very low OSM coverage ({} buildings in {:.1} km²). The generated world may be mostly empty. Consider using a denser urban area.",
+                coverage.building_count, coverage.area_km2
+            );
+            eprintln!("{}", msg.yellow().bold());
+            progress::emit_gui_progress_update(-2.0, &msg);
+        }
+        osm_coverage::CoverageLevel::Low => {
+            println!(
+                "Note: Low OSM coverage ({:.0} buildings/km²). Adding Overture Maps data may help.",
+                coverage.buildings_per_km2
+            );
+        }
+        _ => {}
+    }
 
     // Fetch supplementary data from Overture Maps (buildings, roads, water, land use)
     {

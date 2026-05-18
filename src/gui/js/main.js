@@ -31,6 +31,40 @@ async function setBboxSelectionInfo(bboxSelectionElement, localizationKey, color
   bboxSelectionElement.style.color = color;
 }
 
+
+function formatEstimateTime(secs) {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}min`;
+  return `${(secs / 3600).toFixed(1)}h`;
+}
+
+async function updateEstimate() {
+  if (!selectedBBox || selectedBBox === "0.000000 0.000000 0.000000 0.000000") return;
+
+  const generationMode = document.getElementById("generation-mode-select")?.value || "geo-terrain";
+  const scale = parseFloat(document.getElementById("scale-value-slider")?.value || "1");
+
+  try {
+    const est = await invoke("gui_estimate_generation", {
+      bboxText: selectedBBox,
+      worldScale: scale,
+      terrainEnabled: generationMode !== "geo-only",
+    });
+
+    const timeStr = est.timeMinSec === est.timeMaxSec
+      ? formatEstimateTime(est.timeMinSec)
+      : `${formatEstimateTime(est.timeMinSec)} – ${formatEstimateTime(est.timeMaxSec)}`;
+
+    document.getElementById("estimate-time").textContent = timeStr;
+    document.getElementById("estimate-disk").textContent = `~${est.diskMbMin}–${est.diskMbMax} MB`;
+    document.getElementById("estimate-size").textContent = `${est.worldBlocksX} × ${est.worldBlocksZ} blocks`;
+  } catch (error) {
+    console.warn("Estimate failed:", error);
+  }
+}
+
+window.updateEstimate = updateEstimate;
+
 // Initialize elements and start the demo progress
 window.addEventListener("DOMContentLoaded", async () => {
   registerMessageEvent();
@@ -240,6 +274,24 @@ function setupProgressListener() {
   const progressInfo = document.getElementById("progress-info");
   const progressDetail = document.getElementById("progress-detail");
 
+  window.__TAURI__.event.listen("osm-coverage-warning", (event) => {
+    const { level, buildingCount, buildingsPerKm2, areaKm2 } = event.payload;
+    const banner = document.getElementById("coverage-warning-banner");
+    if (!banner) return;
+
+    if (level === "very_low") {
+      banner.textContent = `⚠ Very low OSM coverage: only ${buildingCount} buildings found in ${areaKm2.toFixed(1)} km². The world may be mostly empty.`;
+      banner.style.display = "block";
+      setTimeout(() => { banner.style.display = "none"; }, 10000);
+    } else if (level === "low") {
+      banner.textContent = `⚠ Low OSM coverage: ${buildingsPerKm2.toFixed(0)} buildings/km² found. Supplementary data may help fill the area.`;
+      banner.style.display = "block";
+      setTimeout(() => { banner.style.display = "none"; }, 8000);
+    } else {
+      banner.style.display = "none";
+    }
+  });
+
   window.__TAURI__.event.listen("progress-update", (event) => {
     const { progress, message } = event.payload;
 
@@ -257,6 +309,8 @@ function setupProgressListener() {
         setWorldNameLabel("");
       } else if (message.startsWith("Done!")) {
         progressInfo.style.color = "#7bd864";
+        const banner = document.getElementById("coverage-warning-banner");
+        if (banner) banner.style.display = "none";
         generationButtonEnabled = true;
       } else {
         progressInfo.style.color = "#ececec";
@@ -354,12 +408,16 @@ function initSettings() {
   // Update slider value display
   slider.addEventListener("input", () => {
     sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+    updateEstimate();
   });
   // Double-click to reset world scale to default (1.00)
   slider.addEventListener("dblclick", () => {
     slider.value = 1;
     sliderValue.textContent = "1.00";
+    updateEstimate();
   });
+
+  document.getElementById("generation-mode-select").addEventListener("change", updateEstimate);
 
   // Rotation angle input
   const rotationInput = document.getElementById("rotation-angle-input");
@@ -916,6 +974,7 @@ function handleBboxInput() {
         if (typeof window.updateRotation === 'function') {
           window.updateRotation(0);
         }
+        updateEstimate();
       } else {
         // Valid numbers but invalid order or range
         customBBoxValid = false;
@@ -1032,6 +1091,9 @@ function displayBboxInfoText(bboxText) {
     if (!customBBoxValid) {
       selectedBBox = "";
     }
+    document.getElementById("estimate-time").textContent = "–";
+    document.getElementById("estimate-disk").textContent = "–";
+    document.getElementById("estimate-size").textContent = "–";
     return;
   }
 
@@ -1042,6 +1104,7 @@ function displayBboxInfoText(bboxText) {
   const selectedSize = calculateBBoxSize(lng1, lat1, lng2, lat2);
 
   displayBboxSizeStatus(bboxSelectionInfo, selectedSize);
+  updateEstimate();
 }
 
 let worldPath = "";
@@ -1144,6 +1207,7 @@ async function startGeneration() {
     var roof = document.getElementById("roof-toggle").checked;
     var fill_ground = document.getElementById("fillground-toggle").checked;
     var land_cover = document.getElementById("land-cover-toggle").checked;
+    var use_overpass_cache = document.getElementById("overpass-cache-toggle").checked;
     var disable_height_limit = document.getElementById("disable-height-limit-toggle").checked;
     var scale = parseFloat(document.getElementById("scale-value-slider").value);
     // var ground_level = parseInt(document.getElementById("ground-level").value, 10);
@@ -1171,6 +1235,7 @@ async function startGeneration() {
         roofEnabled: roof,
         fillgroundEnabled: fill_ground,
         landCoverEnabled: land_cover,
+        useOverpassCache: use_overpass_cache,
         disableHeightLimit: disable_height_limit,
         isNewWorld: true,
         spawnPoint: spawnPoint,
